@@ -38,7 +38,8 @@ glab auth login    # GitLab
 ## Agent Happy Path
 
 1. Create stacked changes using normal git branches.
-2. Open the root PR/MR against trunk, for example `main` or `dev`.
+2. Open the root PR/MR against trunk, for example `main`, `dev`, or the
+   repo-specific branch configured with `stack.trunk`.
 3. Open each child PR/MR against its parent branch.
 4. Preview the stack:
 
@@ -98,6 +99,22 @@ git config stack.codeHost github  # or: gitlab
 ```
 
 Use `STACK_CODE_HOST=github|gitlab` for a one-off override.
+
+## Trunk Branches
+
+By default, `stack` treats `dev`, `main`, and `master` as trunk branches. Trunks
+are the terminal parents where stacks bottom out; they are protected from being
+tracked as feature branches, and root merges repair descendants onto the matching
+remote trunk.
+
+For repos with a different trunk, configure it once:
+
+```bash
+git config --add stack.trunk development
+```
+
+Use multiple `stack.trunk` entries for repos with multiple valid trunks. Use
+`STACK_TRUNKS=development` for a one-off override.
 
 ## Example Output
 

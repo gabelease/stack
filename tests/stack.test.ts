@@ -23,7 +23,7 @@ import * as Proc from "../src/platform/proc.ts";
 import { RepairExecution } from "../src/repairExecution.ts";
 import * as StackBlock from "../src/stackBlock.ts";
 import * as StackGraph from "../src/stackGraph.ts";
-import { StackConfig } from "../src/services/Config.ts";
+import { parseTrunks, resolveTrunks, StackConfig } from "../src/services/Config.ts";
 import { CodeHost } from "../src/services/CodeHost.ts";
 import { CodeHostGitHub } from "../src/services/code-host/GitHub.ts";
 import { CodeHostGitLab } from "../src/services/code-host/GitLab.ts";
@@ -122,13 +122,18 @@ const stackTestLayer = (opts: {
   readonly bases?: Readonly<Record<string, string>>;
   readonly current?: string;
   readonly state?: StackState;
+  readonly trunks?: ReadonlyArray<string>;
   readonly service?: Partial<Git.Interface & CodeHost.Interface>;
   readonly progress?: Array<Progress.ProgressEvent>;
 }) => {
   const pulls = opts.pulls ?? [];
+  const cfgLayer = StackConfig.layer({
+    root: "/tmp/stack",
+    trunks: opts.trunks ?? ["dev"],
+  }).pipe(Layer.provide(NodeServices.layer));
   return Stack.layer.pipe(
     Layer.provideMerge(opts.progress ? Progress.memory(opts.progress) : Progress.noop),
-    Layer.provideMerge(cfg),
+    Layer.provideMerge(cfgLayer),
     Layer.provideMerge(
       gitAndCodeHost({
         refs: () => Effect.succeed(opts.refs),
@@ -435,6 +440,22 @@ const cfg = StackConfig.layer({ root: "/tmp/stack", trunks: ["dev"] }).pipe(
 );
 
 const platform = Proc.live.pipe(Layer.provideMerge(NodeServices.layer));
+
+describe("Config", () => {
+  it("parses newline and comma separated trunk names", () => {
+    expect(parseTrunks("development\nrelease, staging \n development")).toEqual([
+      "development",
+      "release",
+      "staging",
+    ]);
+  });
+
+  it("resolves trunks from env, git config, then defaults", () => {
+    expect(resolveTrunks({ env: "development", git: "main" })).toEqual(["development"]);
+    expect(resolveTrunks({ git: "development\nrelease" })).toEqual(["development", "release"]);
+    expect(resolveTrunks({})).toEqual(["dev", "main", "master"]);
+  });
+});
 
 const make = (state = new StackState({ version: 1, links: [] })) =>
   Stack.layer.pipe(
@@ -1177,7 +1198,49 @@ describe("Git", () => {
       expect(calls).toEqual([
         ["git", "branch", "--show-current"],
         ["git", "checkout", "-B", temp, "dev"],
-        ["git", "cherry-pick", "--empty=drop", "b1"],
+        ["git", "cherry-pick", "b1"],
+        ["git", "cherry-pick", "--abort"],
+        ["git", "checkout", "stack-c"],
+        ["git", "branch", "-D", temp],
+      ]);
+    }).pipe(Effect.provide(Git.live.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))));
+  });
+
+  it.effect("replay skips patch-empty commits on older git versions", () => {
+    const calls: Array<ReadonlyArray<string>> = [];
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, tool, args) =>
+          Effect.gen(function* () {
+            calls.push([tool, ...args]);
+            if (args[0] === "branch" && args[1] === "--show-current") {
+              return "stack-c";
+            }
+            if (args[0] === "cherry-pick" && args[1] === "b1") {
+              return yield* Effect.fail(
+                new ExecError(tool, args, 1, "The previous cherry-pick is now empty"),
+              );
+            }
+            return "";
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(1_700_000_000_000);
+      const git = yield* Git.Service;
+
+      yield* git.replay("stack-b", "dev", ["b1", "b2"]);
+
+      const temp = calls[1]?.[3];
+      expect(calls).toEqual([
+        ["git", "branch", "--show-current"],
+        ["git", "checkout", "-B", temp, "dev"],
+        ["git", "cherry-pick", "b1"],
+        ["git", "cherry-pick", "--skip"],
+        ["git", "cherry-pick", "b2"],
+        ["git", "branch", "-f", "stack-b", temp],
         ["git", "cherry-pick", "--abort"],
         ["git", "checkout", "stack-c"],
         ["git", "branch", "-D", temp],
@@ -1884,6 +1947,88 @@ describe("Stack", () => {
       expect(node?.issues).toEqual([]);
     }).pipe(Effect.provide(make())),
   );
+
+  it.effect("supports development as a configured trunk for an Updog-shaped stack", () => {
+    const state = new StackState({
+      version: 1,
+      links: [
+        stackLink({
+          branch: "codex/stack-smoke-a",
+          parent: "development",
+          anchor: "development-head",
+          pr: 1,
+        }),
+        stackLink({
+          branch: "codex/stack-smoke-b",
+          parent: "codex/stack-smoke-a",
+          anchor: "a-head",
+          pr: 2,
+        }),
+        stackLink({
+          branch: "codex/stack-smoke-c",
+          parent: "codex/stack-smoke-b",
+          anchor: "b-head",
+          pr: 3,
+        }),
+      ],
+    });
+    const layer = stackTestLayer({
+      trunks: ["development"],
+      current: "codex/stack-smoke-c",
+      refs: [
+        ref("development", "development-head"),
+        ref("codex/stack-smoke-a", "a-head"),
+        ref("codex/stack-smoke-b", "b-head"),
+        ref("codex/stack-smoke-c", "c-head"),
+      ],
+      pulls: [
+        pr(1, "codex/stack-smoke-a", "development"),
+        pr(2, "codex/stack-smoke-b", "codex/stack-smoke-a"),
+        pr(3, "codex/stack-smoke-c", "codex/stack-smoke-b"),
+      ],
+      bases: bases(
+        ["codex/stack-smoke-a", "development", "development-head"],
+        ["codex/stack-smoke-b", "codex/stack-smoke-a", "a-head"],
+        ["codex/stack-smoke-c", "codex/stack-smoke-b", "b-head"],
+      ),
+      state,
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const report = yield* stack.status();
+      expect(report.trunks.map(String)).toEqual(["development"]);
+      expect(report.nodes.find((item) => item.branch === "codex/stack-smoke-a")?.parent).toBe(
+        "development",
+      );
+
+      const nonRoot = yield* Effect.flip(stack.land("codex/stack-smoke-b"));
+      expect(String(nonRoot)).toContain("codex/stack-smoke-b is not the oldest branch");
+
+      const root = yield* stack.land("codex/stack-smoke-a");
+      expect(root).toContain("would merge #1 (codex/stack-smoke-a)");
+      expect(root.join("\n")).toContain("next root: codex/stack-smoke-b");
+      expect(root.join("\n")).not.toContain("main");
+      expect(root.join("\n")).not.toContain("master");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("rejects tracking configured development trunk as a feature branch", () => {
+    const layer = stackTestLayer({
+      trunks: ["development"],
+      refs: [ref("development", "development-head"), ref("codex/stack-smoke-a", "a-head")],
+      bases: bases(["codex/stack-smoke-a", "development", "development-head"]),
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const trunk = yield* Effect.flip(stack.adopt("development", "codex/stack-smoke-a"));
+      expect(String(trunk)).toContain("cannot track trunk branch: development");
+
+      const link = yield* stack.adopt("codex/stack-smoke-a", "development");
+      expect(link.parent).toBe("development");
+    }).pipe(Effect.provide(layer));
+  });
 
   it.effect("sync tracks obvious PR-base stacks and journals metadata", () => {
     const refs = [

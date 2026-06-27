@@ -19,6 +19,9 @@ Install and authenticate the matching CLI before running `stack`. The
 `github.com` and `gitlab.com` hosts are detected automatically from `origin`.
 For an enterprise host, run `git config stack.codeHost github` or `git config
 stack.codeHost gitlab`; `STACK_CODE_HOST` is available as a temporary override.
+By default, trunk branches are `dev`, `main`, and `master`. For repos with a
+different trunk, run `git config --add stack.trunk <branch>`; `STACK_TRUNKS` is
+available as a temporary override.
 
 Keep ordinary editing and commits on plain `git`. Use `stack` only for stack
 intent, stack inspection, sync, merge, and undo workflows.
@@ -61,6 +64,19 @@ can restore the previous branch tips, change target branches, and stack metadata
 - `stack history`: show the most recent applied repair journal.
 - `stack undo`: dry-run restore of the most recent applied repair.
 - `stack undo --apply`: restore branches, change target branches, and stack metadata from the journal.
+
+## Configure Trunk Branches
+
+Trunks are the terminal parents where stacks bottom out. `stack` protects them
+from being tracked as feature branches and uses them to decide which branch is
+the oldest/root change in a stack.
+
+```bash
+git config --add stack.trunk development
+```
+
+Use multiple `stack.trunk` entries for repos with multiple valid trunks. Use
+`STACK_TRUNKS=development` for a one-off override.
 
 ## Happy Path: Target Branches Encode The Stack
 
@@ -229,7 +245,8 @@ stack blocks.
 - `stack merge` is dry-run by default.
 - Mutating commands need `--apply`, except `stack merge --auto` waits for the code
   host and repairs descendants after the root lands.
-- Never mutate trunk branches such as `dev`, `main`, or `master`.
+- Never mutate configured trunk branches. The defaults are `dev`, `main`, and
+  `master`, but repos can override them with `stack.trunk` or `STACK_TRUNKS`.
 - Before rebasing a branch, the tool creates a local backup branch.
 - If output is unclear, inspect with `stack status`, `stack history`, or command
   help before applying.

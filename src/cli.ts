@@ -13,7 +13,7 @@ import pkg from "../package.json" with { type: "json" };
 import { BranchError, DirtyWorktreeError, ExecError, MergeBaseError } from "./domain/model.ts";
 import { renderStatus } from "./format.ts";
 import * as Proc from "./platform/proc.ts";
-import { StackConfig, trunks } from "./services/Config.ts";
+import { resolveTrunks, StackConfig } from "./services/Config.ts";
 import { CodeHost } from "./services/CodeHost.ts";
 import { CodeHostGitHub } from "./services/code-host/GitHub.ts";
 import { CodeHostGitLab } from "./services/code-host/GitLab.ts";
@@ -56,7 +56,7 @@ const continueOnFailure = Flag.boolean("continue-on-failure").pipe(
 const guide = `Happy path for stacked changes (GitHub PRs / GitLab MRs)
 
 1. Open the changes with the right target branches.
-   - Root change: target is trunk, for example dev or main.
+   - Root change: target is a configured trunk, for example dev, main, or development.
    - Child change: target is the parent branch.
 
 2. Preview what stack will infer and repair.
@@ -71,7 +71,11 @@ includes open change details when the code host CLI (gh or glab) is available.
 
 Code host selection: github.com and gitlab.com are detected automatically. For
 enterprise hosts, run git config stack.codeHost github|gitlab. The temporary
-STACK_CODE_HOST=github|gitlab environment override takes precedence.`;
+STACK_CODE_HOST=github|gitlab environment override takes precedence.
+
+Default trunks are dev, main, and master. Configure repo-specific trunks with
+git config --add stack.trunk <branch>. The temporary STACK_TRUNKS=branch[,branch]
+environment override takes precedence.`;
 
 const statusCommand = Command.make(
   "status",
@@ -329,12 +333,22 @@ const live = (() => {
 
       const dir = yield* proc.exec(root, "git", ["rev-parse", "--git-common-dir"]);
       const git = path.isAbsolute(dir) ? dir : path.join(root, dir);
+      const configuredTrunks = yield* proc.exec(
+        root,
+        "git",
+        ["config", "--get-all", "stack.trunk"],
+        [0, 1],
+      );
+      const resolvedTrunks = resolveTrunks({
+        env: process.env.STACK_TRUNKS,
+        git: configuredTrunks,
+      });
 
       return StackConfig.layer({
         root,
         store: path.join(git, "stack", "state.json"),
         journal: path.join(git, "stack", "undo.json"),
-        trunks,
+        trunks: resolvedTrunks,
       });
     }),
   ).pipe(Layer.provideMerge(proc));

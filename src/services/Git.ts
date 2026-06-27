@@ -159,12 +159,23 @@ export const live = Layer.effect(
       const restoreCurrent = current
         ? run("git", ["checkout", current]).pipe(Effect.asVoid, Effect.orDie)
         : Effect.void;
+      const isEmptyCherryPick = (err: ExecError) =>
+        err.stderr.includes("previous cherry-pick is now empty") ||
+        err.stderr.includes("nothing to commit");
+      const cherryPick = Effect.fn("Git.replay.cherryPick")((commit: string) =>
+        run("git", ["cherry-pick", commit]).pipe(
+          Effect.asVoid,
+          Effect.catch((err: ExecError) =>
+            isEmptyCherryPick(err)
+              ? run("git", ["cherry-pick", "--skip"], [0]).pipe(Effect.asVoid)
+              : Effect.fail(err),
+          ),
+        ),
+      );
 
       yield* Effect.gen(function* () {
         yield* run("git", ["checkout", "-B", temp, parent]).pipe(Effect.asVoid);
-        if (commits.length > 0) {
-          yield* run("git", ["cherry-pick", "--empty=drop", ...commits]).pipe(Effect.asVoid);
-        }
+        yield* Effect.forEach(commits, cherryPick, { discard: true });
         yield* run("git", ["branch", "-f", branch, temp]).pipe(Effect.asVoid);
       }).pipe(
         Effect.ensuring(
