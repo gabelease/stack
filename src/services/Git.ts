@@ -266,24 +266,30 @@ export const live = Layer.effect(
       const restoreCurrent = current
         ? runAt(root, "git", ["checkout", current]).pipe(Effect.asVoid, Effect.orDie)
         : Effect.void;
+      const cherryPick = Effect.fn("Git.replay.cherryPick")((commit: string) =>
+        runAt(root, "git", ["cherry-pick", commit]).pipe(
+          Effect.asVoid,
+          Effect.catchTag("ExecError", (err) =>
+            Effect.gen(function* () {
+              if (
+                err.stderr.includes("previous cherry-pick is now empty") ||
+                err.stderr.includes("nothing to commit")
+              ) {
+                yield* runAt(root, "git", ["cherry-pick", "--skip"]);
+                return;
+              }
+              const paths = yield* unmergedPaths().pipe(
+                Effect.catch(() => Effect.succeed([] as ReadonlyArray<string>)),
+              );
+              return yield* new ReplayConflictError(branch, parent, paths, err.stderr);
+            }),
+          ),
+        ),
+      );
 
       yield* Effect.gen(function* () {
         yield* runAt(root, "git", ["checkout", "-B", temp, parent]).pipe(Effect.asVoid);
-        if (commits.length > 0) {
-          yield* runAt(root, "git", ["cherry-pick", "--empty=drop", ...commits]).pipe(
-            Effect.asVoid,
-            Effect.catchTag("ExecError", (err) =>
-              Effect.gen(function* () {
-                const paths = yield* unmergedPaths().pipe(
-                  Effect.catch(() => Effect.succeed([] as ReadonlyArray<string>)),
-                );
-                return yield* Effect.fail(
-                  new ReplayConflictError(branch, parent, paths, err.stderr),
-                );
-              }),
-            ),
-          );
-        }
+        yield* Effect.forEach(commits, cherryPick, { concurrency: 1, discard: true });
         if (owner) {
           yield* runAt(root, "git", ["checkout", branch]).pipe(Effect.asVoid);
           yield* runAt(root, "git", ["reset", "--hard", temp]).pipe(Effect.asVoid);

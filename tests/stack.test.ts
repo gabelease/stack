@@ -1325,8 +1325,49 @@ describe("Git", () => {
         ["git", "worktree", "list", "--porcelain", "-z"],
         ["git", "branch", "--show-current"],
         ["git", "checkout", "-B", temp, "dev"],
-        ["git", "cherry-pick", "--empty=drop", "b1"],
+        ["git", "cherry-pick", "b1"],
         ["git", "diff", "--name-only", "--diff-filter=U"],
+        ["git", "cherry-pick", "--abort"],
+        ["git", "checkout", "stack-c"],
+        ["git", "branch", "-D", temp],
+      ]);
+    }).pipe(Effect.provide(Git.live.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))));
+  });
+
+  it.effect("replay skips commits that become empty on older Git versions", () => {
+    const calls: Array<ReadonlyArray<string>> = [];
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, tool, args) =>
+          Effect.gen(function* () {
+            calls.push([tool, ...args]);
+            if (args[0] === "branch" && args[1] === "--show-current") return "stack-c";
+            if (args[0] === "cherry-pick" && args[1] === "b1") {
+              return yield* Effect.fail(
+                new ExecError(tool, args, 1, "The previous cherry-pick is now empty"),
+              );
+            }
+            return "";
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(1_700_000_000_000);
+      const git = yield* Git.Service;
+
+      yield* git.replay("stack-b", "dev", ["b1", "b2"]);
+
+      const temp = calls[2]?.[3];
+      expect(calls).toEqual([
+        ["git", "worktree", "list", "--porcelain", "-z"],
+        ["git", "branch", "--show-current"],
+        ["git", "checkout", "-B", temp, "dev"],
+        ["git", "cherry-pick", "b1"],
+        ["git", "cherry-pick", "--skip"],
+        ["git", "cherry-pick", "b2"],
+        ["git", "branch", "-f", "stack-b", temp],
         ["git", "cherry-pick", "--abort"],
         ["git", "checkout", "stack-c"],
         ["git", "branch", "-D", temp],
