@@ -1066,7 +1066,10 @@ ${note}`;
                     nextPr.title,
                     nextPr.body,
                     nextPr.labels,
-                    headRepository,
+                    {
+                      headRepository,
+                      draft: codeHost.capabilities.drafts && !trunk(parent),
+                    },
                   );
                   created = made.number;
                   num = made.number;
@@ -1657,7 +1660,13 @@ ${note}`;
                   (worktree) => worktree.branch === target && worktree.path !== cfg.root,
                 ) ?? null)
               : null;
-            const next = scopedState.links.find((item) => item.parent === target)?.branch ?? null;
+            const nextRoots = scopedState.links
+              .filter((item) => item.parent === target)
+              .map((item) => String(item.branch));
+            const next = nextRoots[0] ?? null;
+            const draftRoots = codeHost.capabilities.drafts
+              ? pulls.filter((item) => item.draft && nextRoots.includes(String(item.head)))
+              : [];
             const landed = new Set([reference(Number(pr.number)), String(target)]);
             const preRetargets = (yield* Effect.forEach(
               scopedState.links.filter((item) => item.parent === target),
@@ -1780,6 +1789,10 @@ ${note}`;
                 ? `enable auto-merge ${reference(Number(pr.number))} (${target})`
                 : `${apply ? "" : "would "}${admin ? "admin " : ""}merge ${reference(Number(pr.number))} (${target})`,
               ...(auto ? [`wait for ${reference(Number(pr.number))} to merge`] : []),
+              ...draftRoots.map(
+                (item) =>
+                  `${active ? "" : "would "}mark ${reference(Number(item.number))} (${item.head}) ready`,
+              ),
             ];
 
             const repairAfterMerge = Effect.fn("Stack.land.repairAfterMerge")(() =>
@@ -1811,6 +1824,19 @@ ${note}`;
                   yield* codeHost.changes(),
                 );
                 const notes = yield* linksFor(repair.state, true, landed, repairedPulls);
+                yield* Effect.forEach(
+                  codeHost.capabilities.drafts
+                    ? repairedPulls.filter(
+                        (item) => item.draft && nextRoots.includes(String(item.head)),
+                      )
+                    : [],
+                  (item) =>
+                    Effect.gen(function* () {
+                      yield* step(`mark ${reference(Number(item.number))} (${item.head}) ready`);
+                      yield* codeHost.ready(item.number);
+                    }),
+                  { concurrency: 1, discard: true },
+                );
                 if (current !== target) yield* git.switch(current);
                 const tail = next ? `next root: ${next}` : "next root: none";
                 const view = yield* diagram(branches);

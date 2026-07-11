@@ -109,7 +109,7 @@ const meta = (row: PullView) =>
 
 const properties = {
   provider: "github" as const,
-  capabilities: { adminMerge: true },
+  capabilities: { adminMerge: true, drafts: true },
   requestLabel: "PR" as const,
   reference: (number: number) => `#${number}`,
   repository: (remote: string, origin?: string) =>
@@ -198,6 +198,10 @@ export const layer = Layer.effect(
       run(["pr", "edit", `${pr}`, "--body", body]).pipe(Effect.asVoid),
     );
 
+    const ready = Effect.fn("CodeHost.github.ready")((pr: number) =>
+      run(["pr", "ready", `${pr}`]).pipe(Effect.asVoid),
+    );
+
     const close = Effect.fn("CodeHost.github.close")((pr: number) =>
       run(["pr", "close", `${pr}`]).pipe(Effect.asVoid),
     );
@@ -208,8 +212,9 @@ export const layer = Layer.effect(
       title: string,
       body: string,
       labels: ReadonlyArray<string>,
-      headRepository?: string | null,
+      options?: CodeHost.CreateOptions,
     ) {
+      const headRepository = options?.headRepository;
       const head = headRepository ? `${headRepository.split("/")[0]}:${branch}` : branch;
       const created = yield* run([
         "pr",
@@ -223,6 +228,7 @@ export const layer = Layer.effect(
         "--body",
         body,
         ...labels.flatMap((label) => ["--label", label]),
+        ...(options?.draft ? ["--draft"] : []),
       ]);
 
       const number = Number(created.trim().match(/\/pull\/(\d+)\/?$/)?.[1]);
@@ -236,7 +242,7 @@ export const layer = Layer.effect(
         headRepository: headRepository?.toLowerCase() ?? null,
         base,
         url: created.trim(),
-        draft: false,
+        draft: options?.draft ?? false,
       });
     });
 
@@ -249,6 +255,7 @@ export const layer = Layer.effect(
       change,
       edit,
       body,
+      ready,
       close,
       create,
     });

@@ -39,7 +39,8 @@ glab auth login    # GitLab
 
 1. Create stacked changes using normal git branches.
 2. Open the root PR/MR against trunk, for example `main` or `dev`.
-3. Open each child PR/MR against its parent branch.
+3. On GitHub, open each child PR as a draft against its parent branch. GitLab
+   draft state is not managed.
 4. Preview the stack:
 
 ```bash
@@ -70,6 +71,8 @@ then repair descendants automatically after the root lands.
 - Records stack intent in `.git/stack/state.json`.
 - Repairs descendants after parent branches move or land.
 - Retargets PRs/MRs when needed.
+- Creates missing GitHub child PRs as drafts and marks them ready only after
+  they become trunk-targeting roots.
 - Refreshes stack blocks in descriptions.
 - Saves `.git/stack/undo.json` before mutations.
 
@@ -90,6 +93,10 @@ Provider selection is automatic for public hosts:
 
 - `github.com` uses `gh`.
 - `gitlab.com` uses `glab`.
+
+GitHub draft state follows stack position: trunk-targeting PRs are ready and
+child PRs are draft. `stack merge` promotes the next root only after descendant
+repair and pushes finish. GitLab draft state remains unchanged.
 
 For enterprise hosts, configure the repo once:
 

@@ -27,7 +27,8 @@
 - `sync` with no branch scopes to the current stack when the current branch is stack-relevant; when off-stack, it keeps the repo-wide behavior.
 - `sync --apply --continue-on-failure` / `sync --apply --keep-going` processes independent stacks, reports succeeded and failed stacks, preserves per-stack cleanup output, and exits nonzero if any stack failed.
 - `sync` should not auto-track standalone trunk-root requests; infer a trunk-root request only when another open request is based on it.
-- `merge` merges the oldest branch in a stack and immediately repairs descendants; when no branch is given, it infers the root from the current branch. It retargets immediate child requests before merge to preserve open work in auto-delete repos.
+- On GitHub, replacement requests targeting another stack branch are drafts; requests targeting a configured trunk are ready.
+- `merge` merges the oldest branch in a stack and immediately repairs descendants; when no branch is given, it infers the root from the current branch. It retargets immediate child requests before merge to preserve open work in auto-delete repos, then marks each repaired GitHub child ready after it becomes a root.
 - `merge --auto` retargets immediate child requests, enables code-host auto-merge, waits for merge, then repairs descendants.
 - `merge --auto --through <branch-or-change>` repeats root auto-merge and descendant repair until the target branch or request has landed.
 - `history` explains the most recent applied mutation from the undo journal.
@@ -41,6 +42,7 @@
 - Prefer `Context.Service`-based Effect services and test-first changes.
 - Use OpenCode-style service modules for deep seams: export `Interface`, `Service`, adapters like `layer`, `live`, or `memory`, and a namespace self-reexport such as `export * as CodeHost from "./CodeHost.ts"`; consumers import that named namespace directly from the module file.
 - Keep local Git behavior behind `Git` and pull/merge-request behavior behind `CodeHost`. Concrete backends live in `services/code-host/GitHub.ts` (via `gh`) and `services/code-host/GitLab.ts` (via `glab`), while their in-memory contract behavior is shared through `services/code-host/Memory.ts`; the CLI picks one backend at startup from `STACK_CODE_HOST`, `git config stack.codeHost`, or an unambiguous `origin` host. Stack orchestration depends on `CodeHost.Service` rather than shelling out to a host CLI directly.
+- Keep draft-state behavior capability-gated in `CodeHost`; GitHub supports it and GitLab currently does not.
 - Check the local Effect source tree when available before changing Effect APIs or versions.
 - Prefer `effect/Path`, `effect/FileSystem`, and `effect/unstable/process` instead of Node/Bun built-ins in app code.
 - Keep logic literal and debuggable over clever abstractions.

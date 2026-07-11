@@ -144,17 +144,20 @@ export const layer = (opts: Options) =>
         title: string,
         body: string,
         labels: ReadonlyArray<string>,
-        headRepository?: string | null,
+        options?: CodeHost.CreateOptions,
       ) {
+        if (options?.draft && !opts.properties.capabilities.drafts) {
+          return yield* new UnsupportedCodeHostOperation(opts.properties.provider, "draft changes");
+        }
         const number = next++;
         const made = pullRef({
           number,
           title,
           head: branch,
-          headRepository: headRepository ?? null,
+          headRepository: options?.headRepository ?? null,
           base,
           url: opts.url(number),
-          draft: false,
+          draft: options?.draft ?? false,
         });
         yield* record(`create ${branch} ${base}`);
         yield* Ref.update(pullsRef, (pulls) => [...pulls, made]);
@@ -166,7 +169,7 @@ export const layer = (opts: Options) =>
               title,
               body,
               head: branch,
-              headRepository: headRepository ?? null,
+              headRepository: options?.headRepository ?? null,
               base,
               url: made.url,
               draft: made.draft,
@@ -176,6 +179,51 @@ export const layer = (opts: Options) =>
           ),
         );
         return made;
+      });
+      const ready = Effect.fn("CodeHost.memory.ready")(function* (pr: number) {
+        if (!opts.properties.capabilities.drafts) {
+          return yield* new UnsupportedCodeHostOperation(opts.properties.provider, "draft changes");
+        }
+        yield* requireOpen(pr);
+        yield* record(`ready ${pr}`);
+        yield* Ref.update(pullsRef, (pulls) =>
+          pulls.map((item) =>
+            item.number === pr
+              ? pullRef({
+                  number: item.number,
+                  title: item.title,
+                  head: item.head,
+                  headRepository: item.headRepository,
+                  base: item.base,
+                  url: item.url,
+                  draft: false,
+                  checks: item.checks,
+                })
+              : item,
+          ),
+        );
+        yield* Ref.update(metasRef, (metas) => {
+          const nextMetas = new Map(metas);
+          const current = nextMetas.get(pr);
+          if (current) {
+            nextMetas.set(
+              pr,
+              pullMeta({
+                number: current.number,
+                title: current.title,
+                body: current.body,
+                head: current.head,
+                headRepository: current.headRepository,
+                base: current.base,
+                url: current.url,
+                draft: false,
+                state: current.state,
+                labels: current.labels,
+              }),
+            );
+          }
+          return nextMetas;
+        });
       });
       const close = Effect.fn("CodeHost.memory.close")((pr: number) =>
         Effect.gen(function* () {
@@ -213,6 +261,7 @@ export const layer = (opts: Options) =>
         change,
         edit,
         body,
+        ready,
         close,
         create,
       });

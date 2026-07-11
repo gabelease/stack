@@ -6,6 +6,12 @@ export type Provider = "github" | "gitlab";
 
 export interface Capabilities {
   readonly adminMerge: boolean;
+  readonly drafts: boolean;
+}
+
+export interface CreateOptions {
+  readonly headRepository?: string | null;
+  readonly draft?: boolean;
 }
 
 export interface Interface {
@@ -25,6 +31,7 @@ export interface Interface {
   readonly change: (number: number) => Effect.Effect<PullMeta, CodeHostError>;
   readonly edit: (pr: number, base: string) => Effect.Effect<void, CodeHostError>;
   readonly body: (pr: number, body: string) => Effect.Effect<void, CodeHostError>;
+  readonly ready: (pr: number) => Effect.Effect<void, CodeHostError>;
   readonly close: (pr: number) => Effect.Effect<void, CodeHostError>;
   readonly create: (
     branch: string,
@@ -32,7 +39,7 @@ export interface Interface {
     title: string,
     body: string,
     labels: ReadonlyArray<string>,
-    headRepository?: string | null,
+    options?: CreateOptions,
   ) => Effect.Effect<PullRef, CodeHostError>;
 }
 

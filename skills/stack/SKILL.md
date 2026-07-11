@@ -27,6 +27,11 @@ authenticate the matching CLI before running `stack`.
 Keep ordinary editing and commits on plain `git`. Use `stack` only for stack
 intent, inspection, sync, merge, and undo.
 
+On GitHub, keep only PRs that target a configured trunk ready for review. Create
+every child PR as a draft. When repair recreates a missing PR, `stack` applies
+the same rule; after a root lands and repair finishes, it marks the new root
+ready. GitLab draft state is not managed.
+
 ## Mental Model
 
 ```text
@@ -47,13 +52,17 @@ Create PRs with the right target branches so the stack is self-describing:
 
 ```bash
 gh pr create --base dev --head stack-a
-gh pr create --base stack-a --head stack-b
+gh pr create --draft --base stack-a --head stack-b
 stack sync              # preview inferred links and repairs
 stack sync --apply      # record links, repair, retarget, refresh stack blocks
 ```
 
 That's the common loop. `stack sync` previews; `stack sync --apply` does the
-work. Repeat after any parent branch changes or a squash merge lands.
+work. The trunk-targeting root is ready; every child remains draft until repair
+makes it a root. Repeat after any parent branch changes or a squash merge lands.
+For an existing GitHub stack opened entirely ready, run
+`gh pr ready --undo <child-pr>` once for each non-root PR; sync does not demote
+already-ready descendants.
 
 ## Commands
 
@@ -67,13 +76,14 @@ work. Repeat after any parent branch changes or a squash merge lands.
 - `stack sync [branch]` — preview inferred links and repairs (non-mutating).
   Scopes to the current stack if no branch is given.
 - `stack sync --apply [branch]` — infer links, remove stale links, repair
-  descendants, retarget changes, refresh stack blocks, show a tree summary.
+  descendants, retarget changes, recreate missing GitHub children as drafts,
+  refresh stack blocks, show a tree summary.
 - `stack sync --apply --keep-going` — process independent stacks separately,
   report successes and failures, exit nonzero if any failed.
 - `stack merge [branch]` — dry-run root merge plus descendant repair. Infers
   the root from the current branch.
 - `stack merge --apply` — retarget child changes, squash-merge the root, repair
-  descendants.
+  descendants, then mark each new GitHub root ready.
 - `stack merge --auto` — retarget children, enable code-host auto-merge, wait,
   then repair descendants.
 - `stack merge --auto --through <branch-or-change>` — repeat auto-merge one root

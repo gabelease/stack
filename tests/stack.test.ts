@@ -98,7 +98,7 @@ const gitAndCodeHost = (service: Partial<Git.Interface & CodeHost.Interface>) =>
     restore: () => Effect.void,
     push: () => Effect.void,
     provider: "github",
-    capabilities: { adminMerge: true },
+    capabilities: { adminMerge: true, drafts: true },
     requestLabel: "PR",
     reference: (number) => `#${number}`,
     repository: CodeHost.repositoryFor,
@@ -110,6 +110,7 @@ const gitAndCodeHost = (service: Partial<Git.Interface & CodeHost.Interface>) =>
     change: (number) => Effect.fail(new CodeHostChangeNotFoundError(number)),
     edit: () => Effect.void,
     body: () => Effect.void,
+    ready: () => Effect.void,
     close: () => Effect.void,
     create: (branch, base) => Effect.fail(unused("gh", ["pr", "create", branch, base])),
   };
@@ -307,7 +308,7 @@ const integrationGitHub = (opts: {
 
       return CodeHost.Service.of({
         provider: "github",
-        capabilities: { adminMerge: true },
+        capabilities: { adminMerge: true, drafts: true },
         requestLabel: "PR",
         reference: (number) => `#${number}`,
         repository: CodeHost.repositoryFor,
@@ -319,6 +320,7 @@ const integrationGitHub = (opts: {
         change: getPull,
         edit,
         body: updateBody,
+        ready: () => Effect.void,
         close: (pr) => Ref.update(pulls, (items) => items.filter((item) => item.number !== pr)),
         create,
       });
@@ -836,6 +838,7 @@ const makeLand = (
   codeHost: Partial<Git.Interface & CodeHost.Interface> = {},
   includeUnrelatedRoot = false,
   forkStackC = false,
+  childDraft = false,
 ) => {
   const seen: Array<string> = [];
   const refs = new Map([
@@ -860,7 +863,7 @@ const makeLand = (
       head: "stack-b",
       base: "stack-a",
       url: "u5",
-      draft: false,
+      draft: childDraft,
     }),
     pullRef({
       number: 3,
@@ -1019,6 +1022,21 @@ const makeLand = (
             }),
           body: (pr: number, body: string) =>
             Effect.sync(() => void seen.push(`body ${pr} ${body.includes("### [Stack]")}`)),
+          ready: (pr: number) =>
+            Effect.sync(() => {
+              seen.push(`ready ${pr}`);
+              pulls = pulls.map((pull) =>
+                pull.number === pr
+                  ? pullRef({
+                      number: pull.number,
+                      head: pull.head,
+                      base: pull.base,
+                      url: pull.url,
+                      draft: false,
+                    })
+                  : pull,
+              );
+            }),
           close: () => Effect.void,
           create: (
             branch: string,
@@ -1785,18 +1803,56 @@ describe("GitHub", () => {
 
     return Effect.gen(function* () {
       const github = yield* CodeHost.Service;
-      const created = yield* github.create(
-        "feature/x",
-        "main",
-        "restacked",
-        "body",
-        [],
-        "contributor/project",
-      );
+      const created = yield* github.create("feature/x", "main", "restacked", "body", [], {
+        headRepository: "contributor/project",
+      });
 
       expect(Number(created.number)).toBe(7);
       expect(String(created.url)).toBe("https://github.com/upstream/project/pull/7");
       expect(calls).toHaveLength(1);
+    }).pipe(
+      Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
+    );
+  });
+
+  it.effect("creates draft GitHub pull requests and marks them ready", () => {
+    const calls: Array<ReadonlyArray<string>> = [];
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, tool, args) =>
+          Effect.sync(() => {
+            calls.push([tool, ...args]);
+            return args[1] === "create" ? "https://github.com/owner/project/pull/7" : "";
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const github = yield* CodeHost.Service;
+      const created = yield* github.create("feature/x", "main", "draft", "body", [], {
+        draft: true,
+      });
+      yield* github.ready(created.number);
+
+      expect(created.draft).toBe(true);
+      expect(calls).toEqual([
+        [
+          "gh",
+          "pr",
+          "create",
+          "--head",
+          "feature/x",
+          "--base",
+          "main",
+          "--title",
+          "draft",
+          "--body",
+          "body",
+          "--draft",
+        ],
+        ["gh", "pr", "ready", "7"],
+      ]);
     }).pipe(
       Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
     );
@@ -2179,14 +2235,9 @@ describe("GitLab", () => {
 
     return Effect.gen(function* () {
       const gitlab = yield* CodeHost.Service;
-      const created = yield* gitlab.create(
-        "feature/x",
-        "main",
-        "restacked",
-        "body",
-        [],
-        "contributor/project",
-      );
+      const created = yield* gitlab.create("feature/x", "main", "restacked", "body", [], {
+        headRepository: "contributor/project",
+      });
 
       expect(Number(created.number)).toBe(7);
       expect(String(created.url)).toBe("https://gitlab.com/upstream/project/-/merge_requests/7");
@@ -2547,6 +2598,7 @@ describe("Stack", () => {
 
   it.effect("sync refreshes stack blocks for requests created during repair", () => {
     const seen: Array<string> = [];
+    const drafts = new Array<boolean | undefined>();
     let pulls = [pr(2, "active-child", "active-root")];
     const layer = stackTestLayer({
       current: "active-child",
@@ -2572,9 +2624,16 @@ describe("Stack", () => {
             ? Effect.succeed(metaFor(found))
             : Effect.fail(new CodeHostChangeNotFoundError(number));
         },
-        create: (branch, base) =>
+        create: (branch, base, _title, _body, _labels, options) =>
           Effect.sync(() => {
-            const made = pr(3, branch, base);
+            drafts.push(options?.draft);
+            const made = pullRef({
+              number: 3,
+              head: branch,
+              base,
+              url: "u3",
+              draft: options?.draft ?? false,
+            });
             pulls = [...pulls, made];
             return made;
           }),
@@ -2587,6 +2646,53 @@ describe("Stack", () => {
       yield* stack.sync({ branch: "active-child", apply: true });
 
       expect(seen).toContain("body 3");
+      expect(drafts).toEqual([false]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("sync recreates missing descendant pull requests as drafts", () => {
+    const drafts = new Array<boolean | undefined>();
+    let pulls = [pr(1, "root", "dev"), pr(3, "leaf", "child")];
+    const layer = stackTestLayer({
+      current: "leaf",
+      refs: [ref("dev"), ref("root"), ref("child"), ref("leaf")],
+      pulls,
+      bases: bases(["root", "dev", "dev"], ["child", "root", "root"], ["leaf", "child", "child"]),
+      state: stackState([
+        stackLink({ branch: "root", parent: "dev", anchor: "dev", pr: 1 }),
+        stackLink({ branch: "child", parent: "root", anchor: "root", pr: 2 }),
+        stackLink({ branch: "leaf", parent: "child", anchor: "child", pr: 3 }),
+      ]),
+      service: {
+        changes: () => Effect.succeed(pulls),
+        change: (number) => {
+          const found = pulls.find((item) => item.number === number);
+          return found
+            ? Effect.succeed(metaFor(found))
+            : Effect.fail(new CodeHostChangeNotFoundError(number));
+        },
+        create: (branch, base, _title, _body, _labels, options) =>
+          Effect.sync(() => {
+            drafts.push(options?.draft);
+            const made = pullRef({
+              number: 4,
+              head: branch,
+              base,
+              url: "u4",
+              draft: options?.draft ?? false,
+            });
+            pulls = [...pulls, made];
+            return made;
+          }),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      yield* stack.sync({ branch: "leaf", apply: true });
+
+      expect(drafts).toEqual([true]);
+      expect(pulls.find((item) => item.head === "child")?.draft).toBe(true);
     }).pipe(Effect.provide(layer));
   });
 
@@ -3295,7 +3401,7 @@ describe("Stack", () => {
   it.effect("links use scannable GitLab MR references with titles", () => {
     const test = makeSync({
       provider: "gitlab",
-      capabilities: { adminMerge: false },
+      capabilities: { adminMerge: false, drafts: false },
       requestLabel: "MR",
       reference: (number) => `!${number}`,
     });
@@ -3550,6 +3656,19 @@ describe("Stack", () => {
           }).pipe(Effect.provide(doneTest.layer)),
         ),
       );
+  });
+
+  it.effect("land marks a draft child ready after repairing it into the next root", () => {
+    const test = makeLand([], "stack-a", null, {}, false, false, true);
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const output = yield* stack.land("stack-a", { apply: true });
+
+      expect(output).toContain("mark #5 (stack-b) ready");
+      expect(test.seen).toContain("ready 5");
+      expect(test.seen.indexOf("ready 5")).toBeGreaterThan(test.seen.indexOf("push stack-b"));
+    }).pipe(Effect.provide(test.layer));
   });
 
   it.effect("land journals child retargets before a failed root merge", () => {
@@ -3813,13 +3932,15 @@ describe("Stack", () => {
         },
         push: (branch, remote = "origin") =>
           Effect.sync(() => void seen.push(`push ${branch} ${remote}`)),
-        create: (branch, base, _title, _body, _labels, headRepository) =>
+        create: (branch, base, _title, _body, _labels, options) =>
           Effect.sync(() => {
-            seen.push(`create ${headRepository}`);
+            seen.push(`create ${options?.headRepository}`);
             const made = pullRef({
               number: 5,
               head: branch,
-              ...(headRepository === undefined ? {} : { headRepository }),
+              ...(options?.headRepository === undefined
+                ? {}
+                : { headRepository: options.headRepository }),
               base,
               url: "u5",
               draft: false,
@@ -4020,7 +4141,7 @@ describe("Stack", () => {
   it.effect("land rejects GitLab admin merge before mutation", () => {
     const test = makeLand([], "stack-a", null, {
       provider: "gitlab",
-      capabilities: { adminMerge: false },
+      capabilities: { adminMerge: false, drafts: false },
       requestLabel: "MR",
       reference: (number) => `!${number}`,
     });

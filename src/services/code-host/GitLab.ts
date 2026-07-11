@@ -112,7 +112,7 @@ const meta = (row: MRView, headRepository: string | null) =>
 
 const properties = {
   provider: "gitlab" as const,
-  capabilities: { adminMerge: false },
+  capabilities: { adminMerge: false, drafts: false },
   requestLabel: "MR" as const,
   reference: (number: number) => `!${number}`,
   repository: CodeHost.repositoryFor,
@@ -236,6 +236,10 @@ export const layer = Layer.effect(
       ]).pipe(Effect.asVoid),
     );
 
+    const ready = Effect.fn("CodeHost.gitlab.ready")((_pr: number) =>
+      Effect.fail(new UnsupportedCodeHostOperation("gitlab", "draft changes")),
+    );
+
     const close = Effect.fn("CodeHost.gitlab.close")((pr: number) =>
       run(["mr", "close", `${pr}`]).pipe(Effect.asVoid),
     );
@@ -246,8 +250,12 @@ export const layer = Layer.effect(
       title: string,
       body: string,
       labels: ReadonlyArray<string>,
-      headRepository?: string | null,
+      options?: CodeHost.CreateOptions,
     ) {
+      if (options?.draft) {
+        return yield* new UnsupportedCodeHostOperation("gitlab", "draft changes");
+      }
+      const headRepository = options?.headRepository;
       const created = yield* run([
         "mr",
         "create",
@@ -288,6 +296,7 @@ export const layer = Layer.effect(
       change,
       edit,
       body,
+      ready,
       close,
       create,
     });
