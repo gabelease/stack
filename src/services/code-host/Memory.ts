@@ -144,17 +144,17 @@ export const layer = (opts: Options) =>
         title: string,
         body: string,
         labels: ReadonlyArray<string>,
-        headRepository?: string | null,
+        options?: CodeHost.CreateOptions,
       ) {
         const number = next++;
         const made = pullRef({
           number,
           title,
           head: branch,
-          headRepository: headRepository ?? null,
+          headRepository: options?.headRepository ?? null,
           base,
           url: opts.url(number),
-          draft: false,
+          draft: options?.readiness === "draft",
         });
         yield* record(`create ${branch} ${base}`);
         yield* Ref.update(pullsRef, (pulls) => [...pulls, made]);
@@ -166,7 +166,7 @@ export const layer = (opts: Options) =>
               title,
               body,
               head: branch,
-              headRepository: headRepository ?? null,
+              headRepository: options?.headRepository ?? null,
               base,
               url: made.url,
               draft: made.draft,
@@ -176,6 +176,52 @@ export const layer = (opts: Options) =>
           ),
         );
         return made;
+      });
+      const setReadiness = Effect.fn("CodeHost.memory.setReadiness")(function* (
+        pr: number,
+        readiness,
+      ) {
+        yield* requireOpen(pr);
+        const draft = readiness === "draft";
+        yield* record(`${readiness} ${pr}`);
+        yield* Ref.update(pullsRef, (pulls) =>
+          pulls.map((item) =>
+            item.number === pr
+              ? pullRef({
+                  number: item.number,
+                  title: item.title,
+                  head: item.head,
+                  headRepository: item.headRepository,
+                  base: item.base,
+                  url: item.url,
+                  draft,
+                  checks: item.checks,
+                })
+              : item,
+          ),
+        );
+        yield* Ref.update(metasRef, (metas) => {
+          const nextMetas = new Map(metas);
+          const current = nextMetas.get(pr);
+          if (current) {
+            nextMetas.set(
+              pr,
+              pullMeta({
+                number: current.number,
+                title: current.title,
+                body: current.body,
+                head: current.head,
+                headRepository: current.headRepository,
+                base: current.base,
+                url: current.url,
+                draft,
+                state: current.state,
+                labels: current.labels,
+              }),
+            );
+          }
+          return nextMetas;
+        });
       });
       const close = Effect.fn("CodeHost.memory.close")((pr: number) =>
         Effect.gen(function* () {
@@ -213,6 +259,7 @@ export const layer = (opts: Options) =>
         change,
         edit,
         body,
+        setReadiness,
         close,
         create,
       });

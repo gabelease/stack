@@ -236,6 +236,10 @@ export const layer = Layer.effect(
       ]).pipe(Effect.asVoid),
     );
 
+    const setReadiness = Effect.fn("CodeHost.gitlab.setReadiness")((pr, readiness) =>
+      run(["mr", "update", `${pr}`, `--${readiness}`, "--yes"]).pipe(Effect.asVoid),
+    );
+
     const close = Effect.fn("CodeHost.gitlab.close")((pr: number) =>
       run(["mr", "close", `${pr}`]).pipe(Effect.asVoid),
     );
@@ -246,8 +250,9 @@ export const layer = Layer.effect(
       title: string,
       body: string,
       labels: ReadonlyArray<string>,
-      headRepository?: string | null,
+      options?: CodeHost.CreateOptions,
     ) {
+      const headRepository = options?.headRepository;
       const created = yield* run([
         "mr",
         "create",
@@ -262,6 +267,7 @@ export const layer = Layer.effect(
         body,
         "--yes",
         ...labels.flatMap((label) => ["--label", label]),
+        ...(options?.readiness === "draft" ? ["--draft"] : []),
       ]);
 
       const number = Number(created.trim().match(/\/merge_requests\/(\d+)\/?$/)?.[1]);
@@ -275,7 +281,7 @@ export const layer = Layer.effect(
         headRepository: headRepository ?? null,
         base,
         url: created.trim(),
-        draft: false,
+        draft: options?.readiness === "draft",
       });
     });
 
@@ -288,6 +294,7 @@ export const layer = Layer.effect(
       change,
       edit,
       body,
+      setReadiness,
       close,
       create,
     });

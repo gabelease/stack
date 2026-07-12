@@ -8,6 +8,15 @@ export type Trunk = "dev" | "develop" | "main" | "master";
 
 export const trunks: ReadonlyArray<Exclude<Trunk, "develop">> = ["dev", "main", "master"];
 
+export const readinessModes = ["unmanaged", "all-ready", "root-ready"] as const;
+export type ReadinessMode = (typeof readinessModes)[number];
+
+export const parseReadinessMode = (value: string): ReadinessMode | null | undefined => {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "") return undefined;
+  return readinessModes.find((mode) => mode === normalized) ?? null;
+};
+
 export const parseBlockLinkConfig = (value: string): boolean | undefined => {
   const normalized = value.trim().toLowerCase();
   if (normalized === "") return undefined;
@@ -28,6 +37,7 @@ export interface StackConfigService {
   readonly journal: string;
   readonly trunks: ReadonlyArray<BranchName>;
   readonly blockLink: boolean;
+  readonly readinessMode: ReadinessMode;
   readonly codeHostConcurrency: number;
   readonly codeHostWaitIntervalMillis: number;
 }
@@ -41,6 +51,7 @@ export class StackConfig extends Context.Service<StackConfig, StackConfigService
     journal?: string;
     trunks?: ReadonlyArray<string>;
     blockLink?: boolean | undefined;
+    readinessMode?: ReadinessMode;
     codeHostConcurrency?: number;
     codeHostWaitIntervalMillis?: number;
   }) =>
@@ -54,6 +65,7 @@ export class StackConfig extends Context.Service<StackConfig, StackConfigService
           journal: opts.journal ?? path.join(opts.root, ".git", "stack", "undo.json"),
           trunks: (opts.trunks ?? trunks).map((name) => branchName(name)),
           blockLink: opts.blockLink ?? true,
+          readinessMode: opts.readinessMode ?? "unmanaged",
           codeHostConcurrency: opts.codeHostConcurrency ?? 4,
           codeHostWaitIntervalMillis: opts.codeHostWaitIntervalMillis ?? 5_000,
         });

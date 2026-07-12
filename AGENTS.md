@@ -9,12 +9,13 @@
 
 ## Safety rules
 
+- Linked Git worktrees share `.git/stack/state.json`, `.git/stack/undo.json`, and repo-local `stack.*` configuration. Treat each connected stack as owned by one worktree, scope mutations with a branch from that stack, and never mutate another worktree's stack or run cross-worktree stack mutations concurrently without explicit coordination.
 - Bare `stack sync` must stay non-mutating, including scoped and keep-going runs.
 - Mutating commands need an explicit mode: `--apply`, or `merge --auto` for code-host auto-merge plus descendant repair.
 - Never mutate configured trunk branches like `dev`, `main`, or `master`.
 - Before rebasing a branch, create a local backup branch.
 - Before repair mutates Git or a hosted change, save an undo checkpoint. Merge child retargets use a pre-merge recovery journal; after the root lands, descendant repair starts from a post-merge baseline that never retargets children back onto the landed branch.
-- `stack undo` should restore the last applied mutation from the saved journal.
+- `stack undo` should restore the last applied mutation from the saved journal, including hosted-change readiness.
 
 ## Current commands
 
@@ -24,12 +25,14 @@
 - `track` records parentage for an existing branch only when change target branches do not already encode the stack.
 - `sync [branch]` previews target-branch inference, stale metadata cleanup, and repairs without mutating branches, requests, or stack metadata using the tree summary output.
 - `sync --apply [branch]` applies the common maintenance workflow: remove stale local links, infer clear target-branch stack links, repair branches, retarget requests, refresh links, and show a concise tree summary. With a branch argument, sync only the stack containing that branch.
+- `sync [--readiness-mode unmanaged|all-ready|root-ready]` previews the effective readiness policy; `sync --apply` is the explicit conversion and reconciliation path for existing changes.
 - `sync` with no branch scopes to the current stack when the current branch is stack-relevant; when off-stack, it keeps the repo-wide behavior.
 - `sync --apply --continue-on-failure` / `sync --apply --keep-going` processes independent stacks, reports succeeded and failed stacks, preserves per-stack cleanup output, and exits nonzero if any stack failed.
 - `sync` should not auto-track standalone trunk-root requests; infer a trunk-root request only when another open request is based on it.
 - `merge` merges the oldest branch in a stack and immediately repairs descendants; when no branch is given, it infers the root from the current branch. It retargets immediate child requests before merge to preserve open work in auto-delete repos.
 - `merge --auto` retargets immediate child requests, enables code-host auto-merge, waits for merge, then repairs descendants.
 - `merge --auto --through <branch-or-change>` repeats root auto-merge and descendant repair until the target branch or request has landed.
+- `merge [--readiness-mode unmanaged|all-ready|root-ready]` applies the effective policy after descendant repair. It must not promote a draft current root immediately before merge; callers should reconcile with `sync --apply` first so readiness-triggered checks can finish.
 - `history` explains the most recent applied mutation from the undo journal.
 - `undo` restores the last applied mutation.
 
@@ -37,10 +40,10 @@
 
 - Persist stack metadata in `.git/stack/state.json`.
 - Persist undo state in `.git/stack/undo.json`.
-- User preferences live in `git config stack.*` (read at startup in the CLI `live` layer), not in `state.json`. Current keys: `stack.codeHost`, `stack.trunks`, and `stack.blockLink` (default true; set false to render a plain `### Stack` heading without the attribution link).
+- User preferences live in `git config stack.*` (read at startup in the CLI `live` layer), not in `state.json`. Current keys: `stack.codeHost`, `stack.trunks`, `stack.blockLink` (default true; set false to render a plain `### Stack` heading without the attribution link), and `stack.readinessMode` (`unmanaged` by default, or `all-ready` / `root-ready`).
 - Prefer `Context.Service`-based Effect services and test-first changes.
 - Use OpenCode-style service modules for deep seams: export `Interface`, `Service`, adapters like `layer`, `live`, or `memory`, and a namespace self-reexport such as `export * as CodeHost from "./CodeHost.ts"`; consumers import that named namespace directly from the module file.
-- Keep local Git behavior behind `Git` and pull/merge-request behavior behind `CodeHost`. Concrete backends live in `services/code-host/GitHub.ts` (via `gh`) and `services/code-host/GitLab.ts` (via `glab`), while their in-memory contract behavior is shared through `services/code-host/Memory.ts`; the CLI picks one backend at startup from `STACK_CODE_HOST`, `git config stack.codeHost`, or an unambiguous `origin` host. Stack orchestration depends on `CodeHost.Service` rather than shelling out to a host CLI directly.
+- Keep local Git behavior behind `Git` and pull/merge-request behavior behind `CodeHost`. Readiness is a provider-neutral `CodeHost` capability implemented by both GitHub (via `gh`) and GitLab (via `glab`), not host-specific stack orchestration. Concrete backends live in `services/code-host/GitHub.ts` and `services/code-host/GitLab.ts`, while their in-memory contract behavior is shared through `services/code-host/Memory.ts`; the CLI picks one backend at startup from `STACK_CODE_HOST`, `git config stack.codeHost`, or an unambiguous `origin` host. Stack orchestration depends on `CodeHost.Service` rather than shelling out to a host CLI directly.
 - Check the local Effect source tree when available before changing Effect APIs or versions.
 - Prefer `effect/Path`, `effect/FileSystem`, and `effect/unstable/process` instead of Node/Bun built-ins in app code.
 - Keep logic literal and debuggable over clever abstractions.

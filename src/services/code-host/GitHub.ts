@@ -198,6 +198,12 @@ export const layer = Layer.effect(
       run(["pr", "edit", `${pr}`, "--body", body]).pipe(Effect.asVoid),
     );
 
+    const setReadiness = Effect.fn("CodeHost.github.setReadiness")((pr, readiness) =>
+      run(["pr", "ready", `${pr}`, ...(readiness === "draft" ? ["--undo"] : [])]).pipe(
+        Effect.asVoid,
+      ),
+    );
+
     const close = Effect.fn("CodeHost.github.close")((pr: number) =>
       run(["pr", "close", `${pr}`]).pipe(Effect.asVoid),
     );
@@ -208,8 +214,9 @@ export const layer = Layer.effect(
       title: string,
       body: string,
       labels: ReadonlyArray<string>,
-      headRepository?: string | null,
+      options?: CodeHost.CreateOptions,
     ) {
+      const headRepository = options?.headRepository;
       const head = headRepository ? `${headRepository.split("/")[0]}:${branch}` : branch;
       const created = yield* run([
         "pr",
@@ -223,6 +230,7 @@ export const layer = Layer.effect(
         "--body",
         body,
         ...labels.flatMap((label) => ["--label", label]),
+        ...(options?.readiness === "draft" ? ["--draft"] : []),
       ]);
 
       const number = Number(created.trim().match(/\/pull\/(\d+)\/?$/)?.[1]);
@@ -236,7 +244,7 @@ export const layer = Layer.effect(
         headRepository: headRepository?.toLowerCase() ?? null,
         base,
         url: created.trim(),
-        draft: false,
+        draft: options?.readiness === "draft",
       });
     });
 
@@ -249,6 +257,7 @@ export const layer = Layer.effect(
       change,
       edit,
       body,
+      setReadiness,
       close,
       create,
     });

@@ -1,11 +1,16 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
-import type { CodeHostError, PullMeta, PullRef } from "../domain/model.ts";
+import type { ChangeReadiness, CodeHostError, PullMeta, PullRef } from "../domain/model.ts";
 
 export type Provider = "github" | "gitlab";
 
 export interface Capabilities {
   readonly adminMerge: boolean;
+}
+
+export interface CreateOptions {
+  readonly headRepository?: string | null;
+  readonly readiness?: ChangeReadiness;
 }
 
 export interface Interface {
@@ -25,6 +30,10 @@ export interface Interface {
   readonly change: (number: number) => Effect.Effect<PullMeta, CodeHostError>;
   readonly edit: (pr: number, base: string) => Effect.Effect<void, CodeHostError>;
   readonly body: (pr: number, body: string) => Effect.Effect<void, CodeHostError>;
+  readonly setReadiness: (
+    pr: number,
+    readiness: ChangeReadiness,
+  ) => Effect.Effect<void, CodeHostError>;
   readonly close: (pr: number) => Effect.Effect<void, CodeHostError>;
   readonly create: (
     branch: string,
@@ -32,7 +41,7 @@ export interface Interface {
     title: string,
     body: string,
     labels: ReadonlyArray<string>,
-    headRepository?: string | null,
+    options?: CreateOptions,
   ) => Effect.Effect<PullRef, CodeHostError>;
 }
 

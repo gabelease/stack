@@ -1,4 +1,4 @@
-import type { StackLink } from "./domain/model.ts";
+import type { ChangeReadiness, StackLink } from "./domain/model.ts";
 
 export type Mode = "apply" | "dry-run";
 
@@ -56,6 +56,15 @@ export type StackResultItem =
       readonly branch: string;
       readonly base: string;
       readonly pr: number | null;
+      readonly readiness?: ChangeReadiness;
+    }
+  | {
+      readonly _tag: "SetReadiness";
+      readonly mode: Mode;
+      readonly branch: string;
+      readonly pr: number;
+      readonly from: ChangeReadiness;
+      readonly to: ChangeReadiness;
     }
   | { readonly _tag: "UpdateStackLinks"; readonly mode: Mode; readonly pr: number };
 
@@ -98,9 +107,13 @@ export const render = (
     case "RetargetPull":
       return `${prefix(item.mode)}retarget ${reference(item.pr)} to ${item.base}`;
     case "CreatePull":
-      return item.mode === "apply" && item.pr !== null
-        ? `create ${requestLabel.toLowerCase()} ${reference(item.pr)} for ${item.branch} -> ${item.base}`
-        : `would create ${requestLabel.toLowerCase()} for ${item.branch} -> ${item.base}`;
+      return `${
+        item.mode === "apply" && item.pr !== null
+          ? `create ${requestLabel.toLowerCase()} ${reference(item.pr)}`
+          : `would create ${requestLabel.toLowerCase()}`
+      } for ${item.branch} -> ${item.base}${item.readiness ? ` as ${item.readiness}` : ""}`;
+    case "SetReadiness":
+      return `${prefix(item.mode)}mark ${reference(item.pr)} (${item.branch}) ${item.to}`;
     case "UpdateStackLinks":
       return `${item.mode === "apply" ? "update" : "would update"} ${requestLabel} body: ${reference(item.pr)} Stack block`;
   }

@@ -10,6 +10,7 @@ import {
   BranchRef,
   branchName,
   branchRef,
+  type ChangeReadiness,
   DirtyWorktreeError,
   MergeBaseError,
   PullMeta,
@@ -32,7 +33,7 @@ import * as RepairPlan from "../repairPlan.ts";
 import * as StackGraph from "../stackGraph.ts";
 import * as StackBlock from "../stackBlock.ts";
 import * as StackResult from "../stackResult.ts";
-import { StackConfig } from "./Config.ts";
+import { type ReadinessMode, StackConfig } from "./Config.ts";
 import { Git } from "./Git.ts";
 import { CodeHost } from "./CodeHost.ts";
 import * as Progress from "./Progress.ts";
@@ -49,12 +50,14 @@ export interface StackService {
       readonly auto?: boolean;
       readonly admin?: boolean;
       readonly through?: string;
+      readonly readinessMode?: ReadinessMode;
     },
   ) => Effect.Effect<ReadonlyArray<string>, StackError>;
   readonly sync: (opts?: {
     readonly apply?: boolean;
     readonly branch?: string;
     readonly continueOnFailure?: boolean;
+    readonly readinessMode?: ReadinessMode;
   }) => Effect.Effect<ReadonlyArray<string>, StackError>;
   readonly doctor: () => Effect.Effect<ReadonlyArray<string>, StackError>;
   readonly last: () => Effect.Effect<ReadonlyArray<string>, StackError>;
@@ -132,6 +135,118 @@ ${note}`;
       const trunk = (name: string) => cfg.trunks.some((item) => item === name);
       const step = (message: string) => progress.emit({ _tag: "Step", message });
       const wait = (message: string) => progress.emit({ _tag: "Wait", message });
+      const effectiveReadinessMode = (override?: ReadinessMode) => override ?? cfg.readinessMode;
+      const desiredReadiness = (
+        mode: ReadinessMode,
+        parent: string,
+      ): ChangeReadiness | undefined => {
+        if (mode === "unmanaged") return undefined;
+        if (mode === "all-ready") return "ready";
+        return trunk(parent) ? "ready" : "draft";
+      };
+      const pullReadiness = (pull: PullRef): ChangeReadiness => (pull.draft ? "draft" : "ready");
+      const resolvedParent = (
+        link: StackLink,
+        state: ReturnType<typeof stackState>,
+        refs: ReadonlyArray<BranchRef>,
+      ) => {
+        const live = new Set(refs.map((ref) => String(ref.name)));
+        const links = new Map(state.links.map((item) => [String(item.branch), item]));
+        const seen = new Set<string>();
+        let parent = String(link.parent);
+        while (!trunk(parent) && !live.has(parent)) {
+          if (seen.has(parent)) return String(link.parent);
+          seen.add(parent);
+          const next = links.get(parent);
+          if (!next) return parent;
+          parent = String(next.parent);
+        }
+        return parent;
+      };
+      const readinessPlan = (
+        state: ReturnType<typeof stackState>,
+        refs: ReadonlyArray<BranchRef>,
+        pulls: ReadonlyArray<PullRef>,
+        readinessMode: ReadinessMode,
+        mode: StackResult.Mode,
+      ) => {
+        const byBranch = new Map(pulls.map((pull) => [String(pull.head), pull]));
+        return state.links.flatMap((link) => {
+          const pull = byBranch.get(String(link.branch));
+          const to = desiredReadiness(readinessMode, resolvedParent(link, state, refs));
+          if (!pull || !to) return [];
+          const from = pullReadiness(pull);
+          if (from === to) return [];
+          return [
+            {
+              _tag: "SetReadiness",
+              mode,
+              branch: String(link.branch),
+              pr: Number(pull.number),
+              from,
+              to,
+            } satisfies StackResult.StackResultItem,
+          ];
+        });
+      };
+      const upsertUndoEntry = (
+        entries: Array<UndoEntry>,
+        value: Parameters<typeof undoEntry>[0],
+      ) => {
+        const index = entries.findIndex((item) => item.branch === value.branch);
+        const current = index >= 0 ? entries[index]! : null;
+        const readiness = current?.readiness ?? value.readiness;
+        const pushRemotes = value.pushRemotes ?? current?.pushRemotes;
+        const next = undoEntry({
+          branch: value.branch,
+          backup: current?.backup ?? value.backup,
+          pr: current?.pr ?? value.pr,
+          base: current?.base ?? value.base,
+          created: value.created ?? current?.created ?? null,
+          ...(readiness ? { readiness } : {}),
+          ...(pushRemotes ? { pushRemotes } : {}),
+        });
+        if (index >= 0) entries[index] = next;
+        else entries.push(next);
+        return next;
+      };
+      const applyReadiness = Effect.fn("Stack.applyReadiness")(function* (
+        items: ReadonlyArray<StackResult.StackResultItem & { readonly _tag: "SetReadiness" }>,
+        journal: {
+          readonly at: string;
+          readonly state: ReturnType<typeof stackState>;
+          readonly entries: Array<UndoEntry>;
+          readonly actions: Array<StackResult.StackResultItem>;
+        },
+      ) {
+        for (const item of items) {
+          upsertUndoEntry(journal.entries, {
+            branch: item.branch,
+            backup: null,
+            pr: item.pr,
+            base: null,
+            created: null,
+            readiness: item.from,
+          });
+          journal.actions.push(item);
+          yield* store.writeUndo(
+            undoState(
+              journal.at,
+              journal.state,
+              journal.entries,
+              StackResult.renderAll(journal.actions, reference, requestLabel),
+            ),
+          );
+          yield* step(StackResult.render(item, reference, requestLabel));
+          yield* codeHost.setReadiness(item.pr, item.to);
+        }
+        return undoState(
+          journal.at,
+          journal.state,
+          journal.entries,
+          StackResult.renderAll(journal.actions, reference, requestLabel),
+        );
+      });
       const mergeFailure = (err: unknown) =>
         new StackOperationError(
           `${err instanceof Error ? err.message : String(err)}\n\n` +
@@ -196,6 +311,7 @@ ${note}`;
         readonly pulls: ReadonlyArray<PullRef>;
         readonly actions: ReadonlyArray<StackResult.StackResultItem>;
         readonly mode: StackResult.Mode;
+        readonly applyCommand?: string;
         readonly failed?: { readonly branch: string; readonly parent: string };
       }) => {
         const trunkNames = cfg.trunks.map(String);
@@ -217,6 +333,10 @@ ${note}`;
           StackResult.StackResultItem & { readonly _tag: "CreatePull" }
         >();
         const updatedPrs = new Set<number>();
+        const readiness = new Map<
+          string,
+          StackResult.StackResultItem & { readonly _tag: "SetReadiness" }
+        >();
         let backups = 0;
         for (const action of opts.actions) {
           if (action._tag === "Rebase") rebased.set(action.branch, action.parent);
@@ -224,6 +344,7 @@ ${note}`;
           if (action._tag === "CreatePull") created.set(action.branch, action);
           if (action._tag === "Backup") backups += 1;
           if (action._tag === "UpdateStackLinks") updatedPrs.add(action.pr);
+          if (action._tag === "SetReadiness") readiness.set(action.branch, action);
         }
 
         const failedBranch = opts.failed?.branch ?? null;
@@ -273,6 +394,12 @@ ${note}`;
               ? { icon: "◌", note: `would create ${requestLabel}` }
               : { icon: "✓", note: `created ${requestLabel}` };
           }
+          const readinessChange = readiness.get(branch);
+          if (readinessChange) {
+            return opts.mode === "dry-run"
+              ? { icon: "◌", note: `would mark ${readinessChange.to}` }
+              : { icon: "✓", note: `marked ${readinessChange.to}` };
+          }
           return { icon: "●", note: "" };
         };
 
@@ -316,10 +443,20 @@ ${note}`;
               .join(", ")}`,
           );
         }
+        if (readiness.size > 0) {
+          const verb = opts.mode === "dry-run" ? "Would update readiness" : "Updated readiness";
+          summary.push(
+            `${verb}: ${[...readiness.values()]
+              .sort((a, b) => a.pr - b.pr)
+              .map((item) => `${reference(item.pr)} ${item.to}`)
+              .join(", ")}`,
+          );
+        }
         if (backups > 0 && opts.mode === "apply") summary.push(`Backups created: ${backups}`);
         if (summary.length > 0) lines.push("", ...summary);
-        if (opts.mode === "dry-run") lines.push("", "Apply:", "  stack sync --apply");
-        else if (!opts.failed && (backups > 0 || updatedPrs.size > 0)) {
+        if (opts.mode === "dry-run")
+          lines.push("", "Apply:", `  ${opts.applyCommand ?? "stack sync --apply"}`);
+        else if (!opts.failed && (backups > 0 || updatedPrs.size > 0 || readiness.size > 0)) {
           lines.push("", "Undo:", "  stack undo --apply");
         }
         return lines;
@@ -378,6 +515,7 @@ ${note}`;
           case "Rebase":
           case "Push":
           case "CreatePull":
+          case "SetReadiness":
             return action.branch;
           case "RetargetPull":
             return null;
@@ -697,9 +835,9 @@ ${note}`;
             readonly apply: boolean;
             readonly saved?: Map<string, string>;
             readonly journalState?: ReturnType<typeof stackState>;
-            readonly initialEntries?: ReadonlyArray<UndoEntry>;
             readonly journalActions?: ReadonlyArray<StackResult.StackResultItem>;
             readonly initialActions?: ReadonlyArray<StackResult.StackResultItem>;
+            readonly readinessMode?: ReadinessMode;
             readonly replayAnchors?: ReadonlyMap<string, string>;
             readonly writeState?: (
               state: ReturnType<typeof stackState>,
@@ -748,7 +886,7 @@ ${note}`;
             const tips = new Map<string, string | null>();
             const prior = new Map<string, string>();
             const moved = new Set<string>();
-            const entries: Array<UndoEntry> = Array.from(opts.initialEntries ?? []);
+            const entries = new Array<UndoEntry>();
             const next: Array<StackLink> = [];
             let journal = apply && (initialActions.length > 0 || entries.length > 0);
 
@@ -966,18 +1104,14 @@ ${note}`;
                 actions.push(...RepairPlan.rebaseBranch(rebase, mode));
 
                 if (apply) {
-                  const priorEntry = entries.find((item) => item.branch === link.branch) ?? null;
-                  const entry = undoEntry({
+                  upsertUndoEntry(entries, {
                     branch: link.branch,
                     backup,
-                    pr: priorEntry?.pr ?? pr?.number ?? link.pr ?? null,
-                    base: priorEntry?.base ?? base,
-                    created: priorEntry?.created ?? null,
+                    pr: pr?.number ?? link.pr ?? null,
+                    base,
+                    created: null,
                     pushRemotes: targetRemotes,
                   });
-                  const entryIndex = entries.findIndex((item) => item.branch === link.branch);
-                  if (entryIndex >= 0) entries[entryIndex] = entry;
-                  else entries.push(entry);
                   journal = true;
                   yield* RepairExecution.applyRebaseBranch(rebase, {
                     git,
@@ -1008,18 +1142,14 @@ ${note}`;
                 } satisfies RepairPlan.RetargetPullPlan;
                 actions.push(RepairPlan.retargetPull(retarget, mode));
                 if (apply) {
-                  if (!entries.some((item) => item.branch === link.branch)) {
-                    entries.push(
-                      undoEntry({
-                        branch: link.branch,
-                        backup: null,
-                        pr: now.number,
-                        base,
-                        created,
-                      }),
-                    );
-                    journal = true;
-                  }
+                  upsertUndoEntry(entries, {
+                    branch: link.branch,
+                    backup: null,
+                    pr: now.number,
+                    base,
+                    created,
+                  });
+                  journal = true;
                   yield* RepairExecution.applyRetargetPull(retarget, {
                     checkpoint,
                     step,
@@ -1043,21 +1173,18 @@ ${note}`;
 
               const open = prs.get(link.branch) ?? null;
               if (!open) {
+                const readiness = desiredReadiness(opts.readinessMode ?? cfg.readinessMode, parent);
                 if (apply) {
                   const prev = previous;
                   const nextPr = draft(link, parent, prev);
-                  if (!entries.some((item) => item.branch === link.branch)) {
-                    entries.push(
-                      undoEntry({
-                        branch: link.branch,
-                        backup: null,
-                        pr: now?.number ?? link.pr ?? null,
-                        base,
-                        created: null,
-                      }),
-                    );
-                    journal = true;
-                  }
+                  upsertUndoEntry(entries, {
+                    branch: link.branch,
+                    backup: null,
+                    pr: now?.number ?? link.pr ?? null,
+                    base,
+                    created: null,
+                  });
+                  journal = true;
                   yield* step(`create ${requestLabel} for ${link.branch} -> ${parent}`);
                   yield* checkpoint();
                   const made = yield* codeHost.create(
@@ -1066,7 +1193,10 @@ ${note}`;
                     nextPr.title,
                     nextPr.body,
                     nextPr.labels,
-                    headRepository,
+                    {
+                      headRepository,
+                      ...(readiness ? { readiness } : {}),
+                    },
                   );
                   created = made.number;
                   num = made.number;
@@ -1075,29 +1205,16 @@ ${note}`;
                     branch: String(link.branch),
                     base: parent,
                     pr: Number(made.number),
+                    ...(readiness ? { readiness } : {}),
                   } satisfies RepairPlan.CreatePullPlan;
                   actions.push(RepairPlan.createPull(createdPull, mode));
-                  const i = entries.findIndex((item) => item.branch === link.branch);
-                  if (i >= 0) {
-                    entries[i] = undoEntry({
-                      branch: entries[i]!.branch,
-                      backup: entries[i]!.backup,
-                      pr: entries[i]!.pr,
-                      base: entries[i]!.base,
-                      created: made.number,
-                      ...(entries[i]!.pushRemotes ? { pushRemotes: entries[i]!.pushRemotes } : {}),
-                    });
-                  } else {
-                    entries.push(
-                      undoEntry({
-                        branch: link.branch,
-                        backup: null,
-                        pr: now?.number ?? link.pr ?? null,
-                        base,
-                        created: made.number,
-                      }),
-                    );
-                  }
+                  upsertUndoEntry(entries, {
+                    branch: link.branch,
+                    backup: null,
+                    pr: now?.number ?? link.pr ?? null,
+                    base,
+                    created: made.number,
+                  });
                   journal = true;
                   yield* checkpoint();
                 } else {
@@ -1107,6 +1224,7 @@ ${note}`;
                         branch: String(link.branch),
                         base: parent,
                         pr: null,
+                        ...(readiness ? { readiness } : {}),
                       },
                       mode,
                     ),
@@ -1162,6 +1280,15 @@ ${note}`;
           const dryRun = !apply;
           const requestedBranch = opts?.branch;
           const continueOnFailure = opts?.continueOnFailure ?? false;
+          const readinessMode = effectiveReadinessMode(opts?.readinessMode);
+          const applyCommand = [
+            "stack",
+            "sync",
+            ...(requestedBranch ? [requestedBranch] : []),
+            "--apply",
+            ...(continueOnFailure ? ["--continue-on-failure"] : []),
+            ...(opts?.readinessMode ? ["--readiness-mode", opts.readinessMode] : []),
+          ].join(" ");
           const current = requestedBranch && dryRun ? "" : yield* git.current();
           return yield* Effect.gen(function* () {
             if (!dryRun) yield* clean();
@@ -1234,6 +1361,7 @@ ${note}`;
                     journalState: state,
                     replayAnchors,
                     initialActions: scopedInitial,
+                    readinessMode,
                     ...(writeState ? { writeState } : {}),
                     preserveUndo,
                   });
@@ -1245,7 +1373,27 @@ ${note}`;
                     !dryRun && changedOpenPulls ? yield* codeHost.changes() : pulls,
                   );
                   const notes = yield* linksFor(repair.state, !dryRun, new Set(), notesPulls);
-                  const changed = repair.actions.length > 0 || notes.actions.length > 0;
+                  const postPulls = dryRun
+                    ? scopedPulls
+                    : yield* changesForLinks(repair.state.links, yield* codeHost.changes());
+                  const postReadiness = readinessPlan(
+                    repair.state,
+                    refs,
+                    postPulls,
+                    readinessMode,
+                    mode,
+                  );
+                  const readinessActions = [...repair.actions, ...postReadiness];
+                  const finalUndo =
+                    !dryRun && postReadiness.length > 0
+                      ? yield* applyReadiness(postReadiness, {
+                          at: repair.undo?.at ?? (yield* timestamp()),
+                          state,
+                          entries: Array.from(repair.undo?.entries ?? []),
+                          actions: Array.from(repair.actions),
+                        })
+                      : repair.undo;
+                  const changed = readinessActions.length > 0 || notes.actions.length > 0;
                   const lines = !changed
                     ? renderSyncTree({
                         title: "Stack is current",
@@ -1253,15 +1401,17 @@ ${note}`;
                         pulls: scopedPulls,
                         actions: [],
                         mode,
+                        applyCommand,
                       })
                     : renderSyncTree({
                         title: dryRun ? "Sync preview" : "Synced stack",
                         state: repair.state,
-                        pulls: scopedPulls,
-                        actions: [...repair.actions, ...notes.actions],
+                        pulls: postPulls,
+                        actions: [...readinessActions, ...notes.actions],
                         mode,
+                        applyCommand,
                       });
-                  return { lines, undo: repair.undo };
+                  return { lines, undo: finalUndo };
                 }),
             );
 
@@ -1279,13 +1429,24 @@ ${note}`;
             const sections = new Array<string>();
             const aggregateEntries = new Array<UndoEntry>();
             const aggregateActions = new Array<string>();
+            const aggregateBranches = new Set<string>();
+            const aggregateActionLines = new Set<string>();
             let aggregateAt: string | null = null;
 
             const rememberUndo = (run: ReturnType<typeof undoState> | null) => {
               if (!run) return;
               aggregateAt ??= String(run.at);
-              aggregateEntries.push(...run.entries);
-              aggregateActions.push(...run.actions);
+              for (const entry of run.entries) {
+                const branch = String(entry.branch);
+                if (aggregateBranches.has(branch)) continue;
+                aggregateBranches.add(branch);
+                aggregateEntries.push(entry);
+              }
+              for (const action of run.actions) {
+                if (aggregateActionLines.has(action)) continue;
+                aggregateActionLines.add(action);
+                aggregateActions.push(action);
+              }
             };
 
             for (const root of roots) {
@@ -1521,7 +1682,15 @@ ${note}`;
             }),
           );
 
-          return [current, clean, ...trunks, pulls, state, undo];
+          return [
+            current,
+            clean,
+            ...trunks,
+            `info readiness mode: ${cfg.readinessMode}`,
+            pulls,
+            state,
+            undo,
+          ];
         }),
       );
 
@@ -1597,12 +1766,14 @@ ${note}`;
             readonly auto?: boolean;
             readonly admin?: boolean;
             readonly through?: string;
+            readonly readinessMode?: ReadinessMode;
           },
         ) =>
           Effect.gen(function* () {
             const apply = opts?.apply ?? false;
             const auto = opts?.auto ?? false;
             const admin = opts?.admin ?? false;
+            const readinessMode = effectiveReadinessMode(opts?.readinessMode);
             if (apply && auto) {
               return yield* Effect.fail(
                 new StackOperationError("use either --apply or --auto, not both"),
@@ -1645,6 +1816,13 @@ ${note}`;
             if (!pr) {
               return yield* Effect.fail(
                 new StackOperationError(`no open ${requestLabel} found for ${target}`),
+              );
+            }
+            if (readinessMode !== "unmanaged" && pr.draft) {
+              return yield* Effect.fail(
+                new StackOperationError(
+                  `${reference(Number(pr.number))} (${target}) is draft. Reconcile readiness and wait for checks before merging:\n\n  stack sync ${target} --apply --readiness-mode ${readinessMode}`,
+                ),
               );
             }
 
@@ -1759,7 +1937,14 @@ ${note}`;
               scopedState,
               refs.filter((item) => item.name !== target),
               repairPulls,
-              { apply: false },
+              { apply: false, readinessMode },
+            );
+            const plannedReadiness = readinessPlan(
+              plannedRepair.state,
+              refs.filter((item) => item.name !== target),
+              repairPulls,
+              readinessMode,
+              "dry-run",
             );
             if (active) {
               yield* ensureRepairableWorktrees([
@@ -1803,6 +1988,7 @@ ${note}`;
                     saved: new Map([[target, name]]),
                     journalState: nextState,
                     journalActions: retargetActions,
+                    readinessMode,
                     writeState: writeScopedState(branches),
                   },
                 );
@@ -1811,10 +1997,36 @@ ${note}`;
                   yield* codeHost.changes(),
                 );
                 const notes = yield* linksFor(repair.state, true, landed, repairedPulls);
+                const postPulls = yield* changesForLinks(
+                  repair.state.links,
+                  yield* codeHost.changes(),
+                );
+                const postReadiness = readinessPlan(
+                  repair.state,
+                  nextRefs,
+                  postPulls,
+                  readinessMode,
+                  "apply",
+                );
+                if (postReadiness.length > 0) {
+                  yield* applyReadiness(postReadiness, {
+                    at: repair.undo?.at ?? (yield* timestamp()),
+                    state: nextState,
+                    entries: Array.from(repair.undo?.entries ?? []),
+                    actions: Array.from(repair.actions),
+                  });
+                }
                 if (current !== target) yield* git.switch(current);
                 const tail = next ? `next root: ${next}` : "next root: none";
                 const view = yield* diagram(branches);
-                return [...actions, ...repair.lines, ...notes.lines, tail, ...view];
+                return [
+                  ...actions,
+                  ...repair.lines,
+                  ...notes.lines,
+                  ...StackResult.renderAll(postReadiness, reference, requestLabel),
+                  tail,
+                  ...view,
+                ];
               }),
             );
 
@@ -1853,7 +2065,12 @@ ${note}`;
             }
 
             const tail = next ? `next root: ${next}` : "next root: none";
-            return [...actions, ...plannedRepair.lines, tail];
+            return [
+              ...actions,
+              ...plannedRepair.lines,
+              ...StackResult.renderAll(plannedReadiness, reference, requestLabel),
+              tail,
+            ];
           }),
       );
 
@@ -1871,7 +2088,12 @@ ${note}`;
 
           for (const target of chain) {
             if (items.length > 0) items.push("");
-            items.push(...(yield* landOne(target, { auto: true })));
+            items.push(
+              ...(yield* landOne(target, {
+                auto: true,
+                ...(opts.readinessMode ? { readinessMode: opts.readinessMode } : {}),
+              })),
+            );
           }
 
           items.push(`merged through: ${stop}`);
@@ -1896,6 +2118,20 @@ ${note}`;
           const restore = new Set(
             run.entries.flatMap((item) => (item.backup ? [String(item.branch)] : [])),
           );
+          const restoreReadiness = Effect.fn("Stack.undo.restoreReadiness")(function* (
+            readiness: ChangeReadiness,
+          ) {
+            for (const item of run.entries) {
+              if (item.readiness !== readiness || !item.pr || item.created) continue;
+              actions.push(`${mode}mark ${reference(Number(item.pr))} ${readiness}`);
+              if (!apply) continue;
+              const current = yield* codeHost.change(item.pr);
+              if (current.draft === (readiness === "draft")) continue;
+              yield* codeHost.setReadiness(item.pr, readiness);
+            }
+          });
+
+          yield* restoreReadiness("draft");
 
           if (restore.has(current)) {
             actions.push(`${mode}switch to ${trunk}`);
@@ -1930,6 +2166,8 @@ ${note}`;
               if (apply) yield* codeHost.edit(item.pr, item.base);
             }
           }
+
+          yield* restoreReadiness("ready");
 
           actions.push(`${mode}restore stack metadata`);
 

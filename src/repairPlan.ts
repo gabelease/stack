@@ -1,3 +1,4 @@
+import type { ChangeReadiness } from "./domain/model.ts";
 import type { Mode, StackResultItem } from "./stackResult.ts";
 
 export interface RebaseBranchPlan {
@@ -18,6 +19,7 @@ export interface CreatePullPlan {
   readonly branch: string;
   readonly base: string;
   readonly pr: number | null;
+  readonly readiness?: ChangeReadiness;
 }
 
 export const rebaseBranch = (
@@ -42,4 +44,5 @@ export const createPull = (plan: CreatePullPlan, mode: Mode): StackResultItem =>
   branch: plan.branch,
   base: plan.base,
   pr: plan.pr,
+  ...(plan.readiness === undefined ? {} : { readiness: plan.readiness }),
 });

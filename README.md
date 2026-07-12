@@ -16,6 +16,19 @@ repos that squash-merge and delete branches.
 the agent do normal code work with plain `git`, then use `stack` for stack
 inspection, repair, merge, and undo workflows.
 
+## Important: Git Worktrees Share Stack State
+
+Linked worktrees use the same common Git directory, so they also share
+`.git/stack/state.json`, `.git/stack/undo.json`, and repo-local `stack.*`
+configuration. A visible stack is not automatically owned by the current
+worktree.
+
+Treat each connected stack as owned by one worktree. Pass a branch from that
+owned stack to mutating commands, do not operate on another worktree's stack
+without explicit coordination, and do not run stack mutations concurrently
+across worktrees. If the current worktree does not have a stack, create an
+independent one instead of attaching it to an unrelated visible stack.
+
 ## Install
 
 ```bash
@@ -43,24 +56,24 @@ glab auth login    # GitLab
 4. Preview the stack:
 
 ```bash
-stack sync
+stack sync <owned-stack-branch>
 ```
 
 5. Apply the safe maintenance workflow:
 
 ```bash
-stack sync --apply
+stack sync --apply <owned-stack-branch>
 ```
 
 6. Merge from the root when ready:
 
 ```bash
-stack merge
-stack merge --apply
+stack merge <owned-stack-root>
+stack merge <owned-stack-root> --apply
 ```
 
-Use `stack merge --auto` when the code host should wait for merge requirements,
-then repair descendants automatically after the root lands.
+Use `stack merge <owned-stack-root> --auto` when the code host should wait for
+merge requirements, then repair descendants automatically after the root lands.
 
 ## What It Does
 
@@ -70,6 +83,7 @@ then repair descendants automatically after the root lands.
 - Records stack intent in `.git/stack/state.json`.
 - Repairs descendants after parent branches move or land.
 - Retargets PRs/MRs when needed.
+- Reconciles PR/MR readiness according to the effective policy.
 - Refreshes stack blocks in descriptions.
 - Saves `.git/stack/undo.json` before mutations.
 
@@ -98,6 +112,54 @@ git config stack.codeHost github  # or: gitlab
 ```
 
 Use `STACK_CODE_HOST=github|gitlab` for a one-off override.
+
+## Change Readiness
+
+Readiness policy is provider-neutral and works for GitHub PRs and GitLab MRs.
+Configure a repository default with:
+
+```bash
+git config stack.readinessMode root-ready
+```
+
+The supported modes are:
+
+| Mode         | Behavior                                                                  |
+| ------------ | ------------------------------------------------------------------------- |
+| `unmanaged`  | Preserve existing readiness; use the code host's default for new changes. |
+| `all-ready`  | Make every change in the selected stack ready.                            |
+| `root-ready` | Make each trunk-targeting root ready and every descendant draft.          |
+
+`unmanaged` is the default, preserving the behavior of earlier releases. A
+command-line override takes precedence over Git config for that invocation; it
+does not rewrite the configured default:
+
+```bash
+stack sync <owned-stack-branch> --readiness-mode root-ready
+stack sync --apply <owned-stack-branch> --readiness-mode root-ready
+stack merge <owned-stack-branch> --readiness-mode root-ready
+```
+
+An invalid configured value is a startup error even when a flag is present.
+Fix it with `git config stack.readinessMode <mode>` or unset it before retrying.
+
+Use `sync` as the explicit conversion and reconciliation path for an existing
+stack: preview first, then apply. Readiness changes can start checks or reviews,
+so `merge` does not make a draft current root ready immediately before trying to
+merge it. Promote and reconcile first with `stack sync --apply`, wait for any
+required checks, then run `stack merge`. After a root lands and descendants are
+repaired, `merge` applies the effective mode to the remaining stack.
+
+```bash
+gh pr checks <root-change> --watch                    # GitHub
+glab ci status --branch <root-branch> --wait          # GitLab
+```
+
+Applied readiness changes are recorded in the undo journal. `stack undo --apply`
+restores the previous readiness along with branch tips, change targets, and
+stack metadata. Undo does not unmerge a landed root; after a merge it restores
+only the journaled state of the surviving stack. Each applied mutation replaces
+the single shared journal, so inspect `stack history` before undoing.
 
 ## Trunk Branches
 
@@ -133,7 +195,7 @@ Sync preview
 Would update PRs: #101, #102
 
 Apply:
-  stack sync
+  stack sync --apply <owned-stack-branch>
 ```
 
 ```text
@@ -156,13 +218,17 @@ stack sync --apply <branch>
                          # apply only the stack containing branch
 stack sync --apply --keep-going
                          # process independent stacks and report failures
+stack sync --readiness-mode <unmanaged|all-ready|root-ready>
+                         # preview an explicit readiness policy
 stack doctor             # inspect repo, host, metadata, and journal health
 stack merge              # dry-run the next root merge
 stack merge --apply      # merge root and repair descendants
+stack merge --readiness-mode <unmanaged|all-ready|root-ready>
+                         # override configured readiness for this merge
 stack merge --auto       # wait for host requirements, then merge and repair
 stack merge --auto --through <branch-or-change>
                          # auto-merge roots through a bounded target
 stack history            # show the last saved mutation journal
 stack undo               # preview undo
-stack undo --apply       # restore branch tips, request targets, and metadata
+stack undo --apply       # restore tips, targets, readiness, and metadata
 ```

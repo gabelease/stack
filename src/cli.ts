@@ -14,7 +14,14 @@ import skillContent from "../skills/stack/SKILL.md" with { type: "text" };
 import { BranchError, DirtyWorktreeError, ExecError, MergeBaseError } from "./domain/model.ts";
 import { renderStatus } from "./format.ts";
 import * as Proc from "./platform/proc.ts";
-import { parseBlockLinkConfig, parseTrunksConfig, StackConfig, trunks } from "./services/Config.ts";
+import {
+  parseBlockLinkConfig,
+  parseReadinessMode,
+  parseTrunksConfig,
+  readinessModes,
+  StackConfig,
+  trunks,
+} from "./services/Config.ts";
 import { CodeHost } from "./services/CodeHost.ts";
 import { CodeHostGitHub } from "./services/code-host/GitHub.ts";
 import { CodeHostGitLab } from "./services/code-host/GitLab.ts";
@@ -52,6 +59,13 @@ const continueOnFailure = Flag.boolean("continue-on-failure").pipe(
   Flag.withDescription(
     "Process every independent stack and report failures at the end instead of stopping on the first failure.",
   ),
+);
+
+const readinessMode = Flag.choice("readiness-mode", readinessModes).pipe(
+  Flag.withDescription(
+    "Readiness policy for this command: unmanaged preserves existing states, all-ready makes every change ready, and root-ready makes trunk-targeting roots ready and descendants draft.",
+  ),
+  Flag.optional,
 );
 
 const statusCommand = Command.make(
@@ -119,14 +133,17 @@ const syncCommand = Command.make(
     branch: Argument.string("branch").pipe(Argument.optional),
     apply,
     continueOnFailure,
+    readinessMode,
   },
-  Effect.fn(function* ({ branch, apply, continueOnFailure }) {
+  Effect.fn(function* ({ branch, apply, continueOnFailure, readinessMode }) {
     const stack = yield* Stack;
     const branchValue = Option.getOrUndefined(branch);
+    const readinessModeValue = Option.getOrUndefined(readinessMode);
     const items = yield* stack.sync({
       apply,
       continueOnFailure,
       ...(branchValue === undefined ? {} : { branch: branchValue }),
+      ...(readinessModeValue === undefined ? {} : { readinessMode: readinessModeValue }),
     });
     yield* Console.log(items.join("\n"));
   }),
@@ -150,6 +167,10 @@ const syncCommand = Command.make(
     {
       command: "stack sync --apply --continue-on-failure",
       description: "Sync independent stacks and summarize any failures at the end",
+    },
+    {
+      command: "stack sync --apply --readiness-mode root-ready",
+      description: "Make roots ready and descendants draft while syncing the stack",
     },
   ]),
 );
@@ -176,15 +197,18 @@ const mergeCommand = Command.make(
     auto,
     admin,
     through,
+    readinessMode,
   },
-  Effect.fn(function* ({ branch, apply, auto, admin, through }) {
+  Effect.fn(function* ({ branch, apply, auto, admin, through, readinessMode }) {
     const stack = yield* Stack;
     const throughValue = Option.getOrUndefined(through);
+    const readinessModeValue = Option.getOrUndefined(readinessMode);
     const items = yield* stack.land(Option.getOrUndefined(branch), {
       apply,
       auto,
       admin,
       ...(throughValue === undefined ? {} : { through: throughValue }),
+      ...(readinessModeValue === undefined ? {} : { readinessMode: readinessModeValue }),
     });
     yield* Console.log(items.join("\n"));
   }),
@@ -216,6 +240,10 @@ const mergeCommand = Command.make(
     {
       command: "stack merge effectify-watcher --apply --admin",
       description: "Force-merge the root GitHub PR with admin privileges, then repair descendants",
+    },
+    {
+      command: "stack merge effectify-watcher --apply --readiness-mode root-ready",
+      description: "Merge a ready root, then restore the root-ready policy after descendant repair",
     },
   ]),
 );
@@ -324,6 +352,20 @@ const live = (() => {
         [0, 1],
       );
       const blockLink = parseBlockLinkConfig(blockLinkOut);
+      const readinessModeOut = yield* proc.exec(
+        root,
+        "git",
+        ["config", "--get", "stack.readinessMode"],
+        [0, 1],
+      );
+      const readinessMode = parseReadinessMode(readinessModeOut);
+      if (readinessMode === null) {
+        return yield* Effect.fail(
+          new Error(
+            `invalid stack.readinessMode '${readinessModeOut.trim()}'; expected ${readinessModes.join(", ")}`,
+          ),
+        );
+      }
 
       return StackConfig.layer({
         root,
@@ -331,6 +373,7 @@ const live = (() => {
         journal: path.join(git, "stack", "undo.json"),
         trunks: configuredTrunks.length > 0 ? configuredTrunks : trunks,
         blockLink,
+        ...(readinessMode ? { readinessMode } : {}),
       });
     }),
   ).pipe(Layer.provideMerge(proc));

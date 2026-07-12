@@ -6,6 +6,9 @@ export type Source = "explicit" | "inferred" | "root";
 
 export const version = 1;
 
+export const ChangeReadiness = Schema.Union([Schema.Literal("draft"), Schema.Literal("ready")]);
+export type ChangeReadiness = typeof ChangeReadiness.Type;
+
 export const BranchName = Schema.String.pipe(Schema.brand("BranchName"));
 export type BranchName = typeof BranchName.Type;
 
@@ -78,6 +81,7 @@ export class UndoEntry extends Schema.Class<UndoEntry>("UndoEntry")({
   pr: Schema.NullOr(PrNumber),
   base: Schema.NullOr(BranchName),
   created: Schema.NullOr(PrNumber),
+  readiness: Schema.optional(ChangeReadiness),
   pushRemotes: Schema.optional(Schema.Array(Schema.String)),
 }) {}
 
@@ -381,6 +385,7 @@ export const undoEntry = (value: {
   pr: number | null;
   base: string | null;
   created: number | null;
+  readiness?: ChangeReadiness;
   pushRemotes?: ReadonlyArray<string>;
 }) =>
   new UndoEntry({
@@ -389,6 +394,7 @@ export const undoEntry = (value: {
     pr: value.pr === null ? null : prNumber(value.pr),
     base: value.base === null ? null : branchName(value.base),
     created: value.created === null ? null : prNumber(value.created),
+    ...(value.readiness === undefined ? {} : { readiness: value.readiness }),
     ...(value.pushRemotes === undefined ? {} : { pushRemotes: Array.from(value.pushRemotes) }),
   });
 

@@ -26,7 +26,10 @@ import * as StackBlock from "../src/stackBlock.ts";
 import * as StackGraph from "../src/stackGraph.ts";
 import {
   parseBlockLinkConfig,
+  parseReadinessMode,
   parseTrunksConfig,
+  type ReadinessMode,
+  readinessModes,
   StackConfig,
   trunks,
 } from "../src/services/Config.ts";
@@ -110,6 +113,7 @@ const gitAndCodeHost = (service: Partial<Git.Interface & CodeHost.Interface>) =>
     change: (number) => Effect.fail(new CodeHostChangeNotFoundError(number)),
     edit: () => Effect.void,
     body: () => Effect.void,
+    setReadiness: () => Effect.void,
     close: () => Effect.void,
     create: (branch, base) => Effect.fail(unused("gh", ["pr", "create", branch, base])),
   };
@@ -131,13 +135,21 @@ const stackTestLayer = (opts: {
   readonly bases?: Readonly<Record<string, string>>;
   readonly current?: string;
   readonly state?: StackState;
+  readonly readinessMode?: ReadinessMode;
   readonly service?: Partial<Git.Interface & CodeHost.Interface>;
   readonly progress?: Array<Progress.ProgressEvent>;
 }) => {
   const pulls = opts.pulls ?? [];
+  const config = opts.readinessMode
+    ? StackConfig.layer({
+        root: "/tmp/stack",
+        trunks: ["dev"],
+        readinessMode: opts.readinessMode,
+      }).pipe(Layer.provide(NodeServices.layer))
+    : cfg;
   return Stack.layer.pipe(
     Layer.provideMerge(opts.progress ? Progress.memory(opts.progress) : Progress.noop),
-    Layer.provideMerge(cfg),
+    Layer.provideMerge(config),
     Layer.provideMerge(
       gitAndCodeHost({
         refs: () => Effect.succeed(opts.refs),
@@ -253,6 +265,49 @@ const integrationGitHub = (opts: {
             return nextItems;
           });
         });
+      const setReadiness: CodeHost.Interface["setReadiness"] = (pr, readiness) =>
+        Effect.gen(function* () {
+          const draft = readiness === "draft";
+          yield* record(`${readiness} ${pr}`);
+          yield* Ref.update(pulls, (items) =>
+            items.map((item) =>
+              item.number === pr
+                ? pullRef({
+                    number: item.number,
+                    title: item.title,
+                    head: item.head,
+                    headRepository: item.headRepository,
+                    base: item.base,
+                    url: item.url,
+                    draft,
+                    checks: item.checks,
+                  })
+                : item,
+            ),
+          );
+          yield* Ref.update(metas, (items) => {
+            const nextItems = new Map(items);
+            const item = nextItems.get(pr);
+            if (item) {
+              nextItems.set(
+                pr,
+                pullMeta({
+                  number: item.number,
+                  title: item.title,
+                  body: item.body,
+                  head: item.head,
+                  headRepository: item.headRepository,
+                  base: item.base,
+                  url: item.url,
+                  draft,
+                  state: item.state,
+                  labels: item.labels,
+                }),
+              );
+            }
+            return nextItems;
+          });
+        });
       const create = (
         branch: string,
         base: string,
@@ -319,6 +374,7 @@ const integrationGitHub = (opts: {
         change: getPull,
         edit,
         body: updateBody,
+        setReadiness,
         close: (pr) => Ref.update(pulls, (items) => items.filter((item) => item.number !== pr)),
         create,
       });
@@ -836,6 +892,8 @@ const makeLand = (
   codeHost: Partial<Git.Interface & CodeHost.Interface> = {},
   includeUnrelatedRoot = false,
   forkStackC = false,
+  readinessMode: ReadinessMode = "unmanaged",
+  draftBranches: ReadonlySet<string> = new Set(),
 ) => {
   const seen: Array<string> = [];
   const refs = new Map([
@@ -853,21 +911,21 @@ const makeLand = (
       head: "stack-a",
       base: "dev",
       url: "u4",
-      draft: false,
+      draft: draftBranches.has("stack-a"),
     }),
     pullRef({
       number: 5,
       head: "stack-b",
       base: "stack-a",
       url: "u5",
-      draft: false,
+      draft: draftBranches.has("stack-b"),
     }),
     pullRef({
       number: 3,
       head: "stack-c",
       base: forkStackC ? "stack-a" : "stack-b",
       url: "u3",
-      draft: false,
+      draft: draftBranches.has("stack-c"),
     }),
   ];
   if (includeUnrelatedRoot) {
@@ -930,7 +988,7 @@ const makeLand = (
       Layer.provideMerge(progress ? Progress.memory(progress) : Progress.noop),
       Layer.provideMerge(NodeServices.layer),
       Layer.provideMerge(
-        StackConfig.layer({ root: "/tmp/stack", trunks: ["dev"] }).pipe(
+        StackConfig.layer({ root: "/tmp/stack", trunks: ["dev"], readinessMode }).pipe(
           Layer.provide(NodeServices.layer),
         ),
       ),
@@ -953,20 +1011,22 @@ const makeLand = (
             Effect.sync(() => void seen.push(`wait ${pr} ${merged ? "merged" : "open"}`)),
           refs: () => Effect.succeed(Array.from(refs.values())),
           changes: () => Effect.succeed(pulls),
-          change: (pr: number) =>
-            Effect.succeed(
+          change: (pr: number) => {
+            const found = pulls.find((pull) => pull.number === pr);
+            return Effect.succeed(
               pullMeta({
                 number: pr,
                 title: "fix+refactor(vcs): old title",
                 body: "## Summary\n- old body\n\nStacked on #4.\n",
-                head: "stack-a",
-                base: "dev",
-                url: "u4",
-                draft: false,
+                head: found?.head ?? "stack-a",
+                base: found?.base ?? "dev",
+                url: found?.url ?? "u4",
+                draft: found?.draft ?? false,
                 state: "OPEN",
                 labels: [new PullLabel({ name: "beta" })],
               }),
-            ),
+            );
+          },
           current: () => Effect.succeed(currentBranch),
           switch: (branch: string) => Effect.sync(() => void seen.push(`switch ${branch}`)),
           head: (name: string) =>
@@ -1019,6 +1079,21 @@ const makeLand = (
             }),
           body: (pr: number, body: string) =>
             Effect.sync(() => void seen.push(`body ${pr} ${body.includes("### [Stack]")}`)),
+          setReadiness: (pr, readiness) =>
+            Effect.sync(() => {
+              seen.push(`${readiness} ${pr}`);
+              pulls = pulls.map((pull) =>
+                pull.number === pr
+                  ? pullRef({
+                      number: pull.number,
+                      head: pull.head,
+                      base: pull.base,
+                      url: pull.url,
+                      draft: readiness === "draft",
+                    })
+                  : pull,
+              );
+            }),
           close: () => Effect.void,
           create: (
             branch: string,
@@ -1247,6 +1322,28 @@ describe("StackConfig", () => {
     expect(parseBlockLinkConfig("  ")).toBeUndefined();
     expect(parseBlockLinkConfig("maybe")).toBeUndefined();
   });
+
+  it("parses the complete readiness mode enum", () => {
+    expect(readinessModes).toEqual(["unmanaged", "all-ready", "root-ready"]);
+    expect(parseReadinessMode(" unmanaged ")).toBe("unmanaged");
+    expect(parseReadinessMode("ALL-READY")).toBe("all-ready");
+    expect(parseReadinessMode("root-ready")).toBe("root-ready");
+    expect(parseReadinessMode(" ")).toBeUndefined();
+    expect(parseReadinessMode("all-draft")).toBeNull();
+  });
+
+  it.effect("defaults readiness management to unmanaged", () =>
+    Effect.gen(function* () {
+      const config = yield* StackConfig;
+      expect(config.readinessMode).toBe("unmanaged");
+    }).pipe(
+      Effect.provide(
+        StackConfig.layer({ root: "/tmp/stack", trunks: ["dev"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        ),
+      ),
+    ),
+  );
 });
 
 describe("StackGraph", () => {
@@ -1744,18 +1841,45 @@ describe("GitHub", () => {
 
     return Effect.gen(function* () {
       const github = yield* CodeHost.Service;
-      const created = yield* github.create(
-        "feature/x",
-        "main",
-        "restacked",
-        "body",
-        [],
-        "contributor/project",
-      );
+      const created = yield* github.create("feature/x", "main", "restacked", "body", [], {
+        headRepository: "contributor/project",
+      });
 
       expect(Number(created.number)).toBe(7);
       expect(String(created.url)).toBe("https://github.com/upstream/project/pull/7");
       expect(calls).toHaveLength(1);
+    }).pipe(
+      Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
+    );
+  });
+
+  it.effect("creates drafts and changes GitHub readiness through gh", () => {
+    const calls: Array<ReadonlyArray<string>> = [];
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, tool, args) =>
+          Effect.sync(() => {
+            calls.push([tool, ...args]);
+            return args[1] === "create" ? "https://github.com/owner/project/pull/7" : "";
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const github = yield* CodeHost.Service;
+      const created = yield* github.create("feature/x", "main", "title", "body", [], {
+        readiness: "draft",
+      });
+      yield* github.setReadiness(7, "ready");
+      yield* github.setReadiness(7, "draft");
+
+      expect(created.draft).toBe(true);
+      expect(calls[0]).toContain("--draft");
+      expect(calls.slice(1)).toEqual([
+        ["gh", "pr", "ready", "7"],
+        ["gh", "pr", "ready", "7", "--undo"],
+      ]);
     }).pipe(
       Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
     );
@@ -2138,18 +2262,47 @@ describe("GitLab", () => {
 
     return Effect.gen(function* () {
       const gitlab = yield* CodeHost.Service;
-      const created = yield* gitlab.create(
-        "feature/x",
-        "main",
-        "restacked",
-        "body",
-        [],
-        "contributor/project",
-      );
+      const created = yield* gitlab.create("feature/x", "main", "restacked", "body", [], {
+        headRepository: "contributor/project",
+      });
 
       expect(Number(created.number)).toBe(7);
       expect(String(created.url)).toBe("https://gitlab.com/upstream/project/-/merge_requests/7");
       expect(calls).toHaveLength(1);
+    }).pipe(
+      Effect.provide(CodeHostGitLab.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
+    );
+  });
+
+  it.effect("creates drafts and changes GitLab readiness through glab", () => {
+    const calls: Array<ReadonlyArray<string>> = [];
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, tool, args) =>
+          Effect.sync(() => {
+            calls.push([tool, ...args]);
+            return args[1] === "create"
+              ? "https://gitlab.com/owner/project/-/merge_requests/7"
+              : "";
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const gitlab = yield* CodeHost.Service;
+      const created = yield* gitlab.create("feature/x", "main", "title", "body", [], {
+        readiness: "draft",
+      });
+      yield* gitlab.setReadiness(7, "ready");
+      yield* gitlab.setReadiness(7, "draft");
+
+      expect(created.draft).toBe(true);
+      expect(calls[0]).toContain("--draft");
+      expect(calls.slice(1)).toEqual([
+        ["glab", "mr", "update", "7", "--ready", "--yes"],
+        ["glab", "mr", "update", "7", "--draft", "--yes"],
+      ]);
     }).pipe(
       Effect.provide(CodeHostGitLab.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
     );
@@ -2351,6 +2504,235 @@ describe("Stack", () => {
       expect(state.links).toEqual([]);
       expect(undo).toBeNull();
       expect(events).toEqual([]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("sync reconciles configured readiness, supports overrides, and undoes changes", () => {
+    const readinessCalls: Array<string> = [];
+    const events: Array<string> = [];
+    let pulls = [
+      pullRef({ number: 1, head: "root", base: "dev", url: "u1", draft: false }),
+      pullRef({ number: 2, head: "child", base: "root", url: "u2", draft: false }),
+      pullRef({ number: 3, head: "leaf", base: "child", url: "u3", draft: false }),
+    ];
+    const setReadiness: CodeHost.Interface["setReadiness"] = (number, readiness) =>
+      Effect.sync(() => {
+        readinessCalls.push(`${readiness} ${number}`);
+        events.push(`${readiness} ${number}`);
+        pulls = pulls.map((pull) =>
+          pull.number === number
+            ? pullRef({
+                number: pull.number,
+                title: pull.title,
+                head: pull.head,
+                headRepository: pull.headRepository,
+                base: pull.base,
+                url: pull.url,
+                draft: readiness === "draft",
+                checks: pull.checks,
+              })
+            : pull,
+        );
+      });
+    const layer = stackTestLayer({
+      current: "leaf",
+      readinessMode: "root-ready",
+      refs: [ref("dev", "dev"), ref("root", "root"), ref("child", "child"), ref("leaf", "leaf")],
+      bases: bases(["root", "dev", "dev"], ["child", "root", "root"], ["leaf", "child", "child"]),
+      state: stackState([
+        stackLink({ branch: "root", parent: "dev", anchor: "dev", pr: 1 }),
+        stackLink({ branch: "child", parent: "root", anchor: "root", pr: 2 }),
+        stackLink({ branch: "leaf", parent: "child", anchor: "child", pr: 3 }),
+      ]),
+      service: {
+        changes: () => Effect.succeed(pulls),
+        change: (number) => Effect.succeed(metaFor(pulls.find((pull) => pull.number === number)!)),
+        body: (number) => Effect.sync(() => void events.push(`body ${number}`)),
+        setReadiness,
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const store = yield* Store;
+
+      const preview = yield* stack.sync();
+      expect(preview).toContain("   └─ ◌ child #2 would mark draft");
+      expect(preview).toContain("      └─ ◌ leaf #3 would mark draft");
+      expect(readinessCalls).toEqual([]);
+      expect(yield* stack.sync({ readinessMode: "all-ready" })).toContain(
+        "  stack sync --apply --readiness-mode all-ready",
+      );
+
+      yield* stack.sync({ apply: true });
+      expect(readinessCalls).toEqual(["draft 2", "draft 3"]);
+      expect(events.indexOf("draft 2")).toBeGreaterThan(
+        Math.max(...events.map((event, index) => (event.startsWith("body ") ? index : -1))),
+      );
+      expect(pulls.map((pull) => pull.draft)).toEqual([false, true, true]);
+      expect((yield* store.readUndo())?.entries.map((entry) => entry.readiness)).toEqual([
+        "ready",
+        "ready",
+      ]);
+
+      yield* stack.undo(true);
+      expect(readinessCalls).toEqual(["draft 2", "draft 3", "ready 2", "ready 3"]);
+      expect(pulls.map((pull) => pull.draft)).toEqual([false, false, false]);
+
+      yield* stack.sync({ apply: true });
+      yield* stack.sync({ apply: true, readinessMode: "all-ready" });
+      expect(readinessCalls.slice(-4)).toEqual(["draft 2", "draft 3", "ready 2", "ready 3"]);
+      expect(pulls.map((pull) => pull.draft)).toEqual([false, false, false]);
+
+      const calls = readinessCalls.length;
+      yield* stack.sync({ apply: true, readinessMode: "all-ready" });
+      expect(readinessCalls).toHaveLength(calls);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("unmanaged sync preserves existing readiness", () => {
+    const readinessCalls: Array<string> = [];
+    let pulls = [
+      pullRef({ number: 1, head: "root", base: "dev", url: "u1", draft: true }),
+      pullRef({ number: 2, head: "child", base: "root", url: "u2", draft: false }),
+    ];
+    const layer = stackTestLayer({
+      current: "child",
+      refs: [ref("dev", "dev"), ref("root", "root"), ref("child", "child")],
+      pulls,
+      bases: bases(["root", "dev", "dev"], ["child", "root", "root"]),
+      state: stackState([
+        stackLink({ branch: "root", parent: "dev", anchor: "dev", pr: 1 }),
+        stackLink({ branch: "child", parent: "root", anchor: "root", pr: 2 }),
+      ]),
+      service: {
+        changes: () => Effect.succeed(pulls),
+        setReadiness: (number, readiness) =>
+          Effect.sync(() => {
+            readinessCalls.push(`${readiness} ${number}`);
+            pulls = pulls.map((pull) =>
+              pull.number === number
+                ? pullRef({
+                    number: pull.number,
+                    head: pull.head,
+                    base: pull.base,
+                    url: pull.url,
+                    draft: readiness === "draft",
+                  })
+                : pull,
+            );
+          }),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      yield* stack.sync({ apply: true });
+      expect(readinessCalls).toEqual([]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("scoped readiness sync does not touch independent stacks", () => {
+    const readinessCalls: Array<string> = [];
+    let pulls = [
+      pr(1, "app-root", "dev"),
+      pr(2, "app-child", "app-root"),
+      pr(3, "other-root", "dev"),
+      pr(4, "other-child", "other-root"),
+    ];
+    const layer = stackTestLayer({
+      current: "dev",
+      readinessMode: "root-ready",
+      refs: [
+        ref("dev", "dev"),
+        ref("app-root", "app-root"),
+        ref("app-child", "app-child"),
+        ref("other-root", "other-root"),
+        ref("other-child", "other-child"),
+      ],
+      pulls,
+      bases: bases(
+        ["app-root", "dev", "dev"],
+        ["app-child", "app-root", "app-root"],
+        ["other-root", "dev", "dev"],
+        ["other-child", "other-root", "other-root"],
+      ),
+      state: stackState([
+        stackLink({ branch: "app-root", parent: "dev", anchor: "dev", pr: 1 }),
+        stackLink({ branch: "app-child", parent: "app-root", anchor: "app-root", pr: 2 }),
+        stackLink({ branch: "other-root", parent: "dev", anchor: "dev", pr: 3 }),
+        stackLink({ branch: "other-child", parent: "other-root", anchor: "other-root", pr: 4 }),
+      ]),
+      service: {
+        changes: () => Effect.succeed(pulls),
+        setReadiness: (number, readiness) =>
+          Effect.sync(() => {
+            readinessCalls.push(`${readiness} ${number}`);
+            pulls = pulls.map((pull) =>
+              pull.number === number
+                ? pullRef({
+                    number: pull.number,
+                    head: pull.head,
+                    base: pull.base,
+                    url: pull.url,
+                    draft: readiness === "draft",
+                  })
+                : pull,
+            );
+          }),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      yield* stack.sync({ branch: "app-child", apply: true });
+      expect(readinessCalls).toEqual(["draft 2"]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("replacement creation uses the effective readiness mode", () => {
+    const creationReadiness = new Array<string | undefined>();
+    let pulls = [pr(1, "root", "dev"), pr(3, "leaf", "child")];
+    const layer = stackTestLayer({
+      current: "leaf",
+      readinessMode: "root-ready",
+      refs: [ref("dev", "dev"), ref("root", "root"), ref("child", "child"), ref("leaf", "leaf")],
+      bases: bases(["root", "dev", "dev"], ["child", "root", "root"], ["leaf", "child", "child"]),
+      state: stackState([
+        stackLink({ branch: "root", parent: "dev", anchor: "dev", pr: 1 }),
+        stackLink({ branch: "child", parent: "root", anchor: "root", pr: 2 }),
+        stackLink({ branch: "leaf", parent: "child", anchor: "child", pr: 3 }),
+      ]),
+      service: {
+        changes: () => Effect.succeed(pulls),
+        change: (number) => {
+          const pull = pulls.find((item) => item.number === number);
+          return pull
+            ? Effect.succeed(metaFor(pull))
+            : Effect.fail(new CodeHostChangeNotFoundError(number));
+        },
+        create: (branch, base, title, _body, _labels, options) =>
+          Effect.sync(() => {
+            creationReadiness.push(options?.readiness);
+            const made = pullRef({
+              number: 4,
+              title,
+              head: branch,
+              base,
+              url: "u4",
+              draft: options?.readiness === "draft",
+            });
+            pulls = [...pulls, made];
+            return made;
+          }),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      yield* stack.sync({ apply: true });
+      expect(creationReadiness).toEqual(["draft"]);
+      expect(pulls.find((pull) => pull.head === "child")?.draft).toBe(true);
     }).pipe(Effect.provide(layer));
   });
 
@@ -2814,6 +3196,7 @@ describe("Stack", () => {
       expect(items).toContain("ok current branch: effectify-format");
       expect(items).toContain("ok worktree clean");
       expect(items).toContain("ok trunk branch: dev");
+      expect(items).toContain("info readiness mode: unmanaged");
       expect(items).toContain("ok open PRs visible: 5");
       expect(items).toContain("ok stack metadata: 0 link(s)");
       expect(items).toContain("ok undo journal: none");
@@ -3530,6 +3913,78 @@ describe("Stack", () => {
     }).pipe(Effect.provide(test.layer));
   });
 
+  it.effect("managed merge requires a draft root to be synced first", () => {
+    const calls: Array<string> = [];
+    const root = pullRef({ number: 1, head: "root", base: "dev", url: "u1", draft: true });
+    const layer = stackTestLayer({
+      current: "root",
+      readinessMode: "root-ready",
+      refs: [ref("dev", "dev"), ref("root", "root")],
+      pulls: [root],
+      bases: bases(["root", "dev", "dev"]),
+      state: stackState([stackLink({ branch: "root", parent: "dev", anchor: "dev", pr: 1 })]),
+      service: {
+        merge: (number) => Effect.sync(() => void calls.push(`merge ${number}`)),
+        setReadiness: (number, readiness) =>
+          Effect.sync(() => void calls.push(`${readiness} ${number}`)),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const error = yield* Effect.flip(stack.land("root", { apply: true }));
+      expect(error.message).toContain("stack sync root --apply --readiness-mode root-ready");
+      expect(calls).toEqual([]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("managed merge promotes the next root only after descendant repair", () => {
+    const test = makeLand(
+      [],
+      "stack-a",
+      null,
+      {},
+      false,
+      false,
+      "root-ready",
+      new Set(["stack-b", "stack-c"]),
+    );
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const store = yield* Store;
+      const output = yield* stack.land("stack-a", { apply: true });
+
+      expect(output).toContain("mark #5 (stack-b) ready");
+      expect(test.seen).toContain("ready 5");
+      expect(test.seen).not.toContain("ready 3");
+      expect(test.seen.indexOf("ready 5")).toBeGreaterThan(
+        Math.max(...test.seen.map((item, index) => (item.startsWith("body ") ? index : -1))),
+      );
+      expect((yield* store.readUndo())?.entries.find((entry) => entry.pr === 5)?.readiness).toBe(
+        "draft",
+      );
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("root-ready merge reconciles and undoes readiness after repair", () => {
+    const test = makeLand([], "stack-a", null, {}, false, false, "root-ready");
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      yield* stack.land("stack-a", { apply: true });
+
+      const lastBody = Math.max(
+        ...test.seen.map((item, index) => (item.startsWith("body ") ? index : -1)),
+      );
+      expect(test.seen).not.toContain("draft 5");
+      expect(test.seen.indexOf("draft 3")).toBeGreaterThan(lastBody);
+
+      yield* stack.undo(true);
+      expect(test.seen.indexOf("ready 3")).toBeGreaterThan(test.seen.indexOf("draft 3"));
+    }).pipe(Effect.provide(test.layer));
+  });
+
   it.effect("land removes root-only stack metadata", () => {
     let changes = [pr(4, "stack-a", "dev")];
     const layer = stackTestLayer({
@@ -3772,8 +4227,9 @@ describe("Stack", () => {
         },
         push: (branch, remote = "origin") =>
           Effect.sync(() => void seen.push(`push ${branch} ${remote}`)),
-        create: (branch, base, _title, _body, _labels, headRepository) =>
+        create: (branch, base, _title, _body, _labels, options) =>
           Effect.sync(() => {
+            const headRepository = options?.headRepository;
             seen.push(`create ${headRepository}`);
             const made = pullRef({
               number: 5,
@@ -3894,6 +4350,31 @@ describe("Stack", () => {
       expect(test.seen).toContain("auto 4");
       expect(test.seen).toContain("auto 5");
       expect(test.seen).not.toContain("auto 3");
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("land auto propagates a readiness override through every merge", () => {
+    const test = makeLand(
+      [],
+      "stack-a",
+      null,
+      {},
+      false,
+      false,
+      "unmanaged",
+      new Set(["stack-b", "stack-c"]),
+    );
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      yield* stack.land(undefined, {
+        auto: true,
+        through: "5",
+        readinessMode: "root-ready",
+      });
+
+      expect(test.seen).toContain("ready 5");
+      expect(test.seen).toContain("ready 3");
     }).pipe(Effect.provide(test.layer));
   });
 
@@ -5066,10 +5547,18 @@ describe("CodeHost", () => {
       const log: Array<string> = [];
       return Effect.gen(function* () {
         const host = yield* CodeHost.Service;
-        const created = yield* host.create("feature/x", "main", "title", "body", ["bug"]);
+        const created = yield* host.create("feature/x", "main", "title", "body", ["bug"], {
+          readiness: "draft",
+        });
         expect(String(created.head)).toBe("feature/x");
         expect(String(created.base)).toBe("main");
+        expect(created.draft).toBe(true);
         expect(yield* host.changes()).toHaveLength(1);
+
+        yield* host.setReadiness(created.number, "ready");
+        expect((yield* host.change(created.number)).draft).toBe(false);
+        yield* host.setReadiness(created.number, "draft");
+        expect((yield* host.changes())[0]?.draft).toBe(true);
 
         yield* host.edit(created.number, "dev");
         yield* host.body(created.number, "updated body");
@@ -5089,6 +5578,8 @@ describe("CodeHost", () => {
         expect(yield* host.changes()).toHaveLength(0);
         expect(log).toEqual([
           "create feature/x main",
+          `ready ${created.number}`,
+          `draft ${created.number}`,
           `edit ${created.number} dev`,
           `body ${created.number}`,
           `auto ${created.number}`,
